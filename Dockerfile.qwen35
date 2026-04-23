@@ -1,0 +1,131 @@
+# syntax=docker/dockerfile:1.7
+# Dockerfile for Qwen3.5-122B-A10B SFT via megatron-bridge
+# Base: NGC PyTorch 25.06 (Py 3.12 + CUDA 12.8 + Torch 2.7 + cuDNN 9 + NCCL)
+# Driver requirement: >= 555 (host driver 570.133.20 OK)
+#
+# Build:
+#   cd /data/temp/Megatron-Bridge
+#   docker build -f Dockerfile.qwen35 -t qwen35-mbridge:cu128 .
+#
+# Run (mount source + HF weights + workspace):
+#   docker run --rm -it --gpus all --shm-size=64g --ulimit memlock=-1 \
+#     -v /data/temp/Megatron-Bridge:/workspace/Megatron-Bridge \
+#     -v /mnt/tidal-alsh01/dataset/redone/checkpoints/opensource:/models:ro \
+#     -v /data/temp/workspace:/workspace/runs \
+#     -w /workspace/Megatron-Bridge \
+#     qwen35-mbridge:cu128 bash
+
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.06-py3
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    HF_HOME=/workspace/hf_cache \
+    CUDA_DEVICE_MAX_CONNECTIONS=1 \
+    NCCL_NVLS_ENABLE=0 \
+    TORCH_NCCL_AVOID_RECORD_STREAMS=1
+
+# System deps (most already in NGC image)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git git-lfs ninja-build cmake curl ca-certificates jq && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install uv (Astral) into /usr/local/bin
+RUN curl -LsSf https://astral.sh/uv/0.9.18/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# Working directory inside the container
+WORKDIR /opt/build
+
+# Copy the megatron-bridge source tree (use .dockerignore to skip .venv, .git/objects)
+# When building, ensure .venv is excluded (see .dockerignore note below)
+COPY . /opt/build/Megatron-Bridge
+
+# Create the venv that re-uses NGC's torch / TE / cuDNN via system-site-packages
+# This is the same pattern as docker/common/install.sh in megatron-bridge
+RUN cd /opt/build/Megatron-Bridge && \
+    git submodule update --init --recursive && \
+    uv venv ${UV_PROJECT_ENVIRONMENT} --python 3.12 --system-site-packages
+
+# Stage 1: build group (cython / pybind11 / nvidia-mathdx)
+RUN cd /opt/build/Megatron-Bridge && \
+    UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} \
+    uv sync --only-group build \
+        --no-install-package torch \
+        --no-install-package torchvision \
+        --no-install-package triton
+
+# Stage 2: full sync, skipping torch/CUDA libs (we install cu128 explicitly later)
+# Driver 570.x supports CUDA <= 12.9 → MUST use cu128 link, NEVER cu13
+RUN cd /opt/build/Megatron-Bridge && \
+    UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} \
+    uv sync --link-mode copy --all-extras --all-groups \
+        --no-install-package torch \
+        --no-install-package torchvision \
+        --no-install-package triton \
+        --no-install-package nvidia-cublas \
+        --no-install-package nvidia-cuda-cupti \
+        --no-install-package nvidia-cuda-nvrtc \
+        --no-install-package nvidia-cuda-runtime \
+        --no-install-package nvidia-cudnn-cu13 \
+        --no-install-package nvidia-cufft \
+        --no-install-package nvidia-cufile \
+        --no-install-package nvidia-curand \
+        --no-install-package nvidia-cusolver \
+        --no-install-package nvidia-cusparse \
+        --no-install-package nvidia-cusparselt-cu13 \
+        --no-install-package nvidia-nccl-cu13 \
+        --no-install-package nvidia-nvjitlink \
+        --no-install-package nvidia-nvshmem-cu13 \
+        --no-install-package nvidia-nvtx \
+        --no-install-package cuda-toolkit \
+        --no-install-package transformer-engine \
+        --no-install-package transformer-engine-torch \
+        --no-install-package transformer-engine-cu12 \
+        --no-install-package flash-attn \
+        --no-install-package mamba-ssm \
+        --no-install-package causal-conv1d
+
+# Stage 3: install cu128 torch (driver 570 compatible, CUDA <= 12.9)
+# torch 2.8.0 is required because TE 2.7 wheels were built against torch 2.8 ABI
+RUN UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} \
+    uv pip install --link-mode copy --python ${UV_PROJECT_ENVIRONMENT}/bin/python \
+      --index-url https://download.pytorch.org/whl/cu128 \
+      "torch==2.8.*" "torchvision"
+
+# Stage 4: TransformerEngine 2.7 (TE 2.10 has ABI mismatch with torch 2.8)
+RUN UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} \
+    uv pip install --link-mode copy --python ${UV_PROJECT_ENVIRONMENT}/bin/python \
+      --no-build-isolation --extra-index-url https://pypi.nvidia.com \
+      "transformer-engine[pytorch]==2.7.*"
+
+# Stage 5: native build packages that need torch already present
+# flash-attn 2.8.1 is the max version supported by TE 2.7
+RUN UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} \
+    uv pip install --link-mode copy --python ${UV_PROJECT_ENVIRONMENT}/bin/python \
+      --no-build-isolation --no-cache --no-deps \
+      "flash-attn==2.8.1" "causal-conv1d==1.6.1" "mamba-ssm==2.3.1"
+
+# Stage 6: install megatron-bridge itself (editable)
+RUN cd /opt/build/Megatron-Bridge && \
+    UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} \
+    uv pip install --no-deps -e .
+
+# Quick sanity at build time (won't actually use GPU at this stage)
+RUN ${UV_PROJECT_ENVIRONMENT}/bin/python -c "\
+import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda); \
+import transformer_engine, transformer_engine.pytorch; print('TE', transformer_engine.__version__); \
+import flash_attn; print('flash-attn', flash_attn.__version__); \
+import mamba_ssm; print('mamba-ssm', mamba_ssm.__version__); \
+import causal_conv1d; print('causal-conv1d', causal_conv1d.__version__); \
+import megatron.core; print('megatron-core', megatron.core.__version__); \
+from megatron.bridge import AutoBridge; print('megatron-bridge AutoBridge OK'); \
+from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLMoEBridge; print('Qwen35VLMoEBridge OK')"
+
+# Ensure venv binaries are first on PATH for the runtime user
+ENV PATH=${UV_PROJECT_ENVIRONMENT}/bin:${PATH}
+WORKDIR /workspace
+CMD ["/bin/bash"]

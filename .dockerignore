@@ -16,3 +16,13 @@ coverage.xml
 *.log
 **/*.nemo
 **/*.ckpt
+# Build artefacts — exclude to keep build context small
+.venv
+.git/objects/pack
+3rdparty/Megatron-LM/.git/objects/pack
+build
+dist
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
