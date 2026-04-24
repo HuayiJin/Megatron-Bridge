@@ -74,8 +74,9 @@ Image: built from `Dockerfile.qwen35`, base `nvcr.io/nvidia/pytorch:25.06-py3`
 |--------|---------|
 | Interpreter | `/opt/venv-mbridge/bin/python` |
 | Install runtime-deferred deps (mamba-ssm/causal-conv1d/fla) | `bash scripts/install_runtime_deps.sh` |
-| 2-node × 8-GPU LoRA SFT (current task) | `RANK=<0|1> bash scripts/run_sft_qwen35_122b_2node_lora.sh` |
-| 4-node × 8-GPU full SFT (later) | `RANK=<0|1|2|3> bash scripts/run_sft_qwen35_122b_4node.sh` |
+| 2-node × 8-GPU LoRA SFT | `RANK=<0|1> MASTER_PORT=23456 bash /mnt/tidal-alsh01/dataset/redone/hade/dd/start.sh` |
+| 4-node × 8-GPU full SFT | `RANK=<0|1|2|3> MASTER_PORT=23456 bash /mnt/tidal-alsh01/dataset/redone/hade/dd/start_4node.sh` |
+| Underlying SFT scripts | `scripts/run_sft_qwen35_122b_2node_lora.sh` / `scripts/run_sft_qwen35_122b_4node.sh` |
 | Verify mcore ckpt structure (no GPU) | `/opt/venv-mbridge/bin/python scripts/verify_mcore_ckpt.py /mnt/tidal-alsh01/dataset/redone/hade/data/Qwen3.5-122B-A10B-mcore` |
 | 1-node 8-GPU VL inference smoke | `bash scripts/run_smoke_qwen35_122b.sh` |
 | Operator runbook (per-node steps, troubleshooting) | `docs/qwen35_122b_sft_runbook.md` |
