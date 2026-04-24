@@ -334,8 +334,23 @@ except ImportError:
 PYEOF
 
 # ------------------------------------------------------------------------------
-# Build-time sanity. Now that mamba_ssm / megatron.bridge are NOT in the image,
-# we can do real imports for everything that IS installed without GPU.
+# Build-time sanity (NO-GPU build host).
+#
+# HARD CONSTRAINT: this RUN must NOT execute any code path that touches a CUDA
+# driver. The build host has no GPU; any `import mamba_ssm*` (Triton autotune
+# at module load) or `import megatron.bridge` (chains into emerging_optimizers
+# triton autotuner) will crash with "RuntimeError: 0 active drivers".
+#
+# Allowed:
+#   - real `import torch / TE / flash_attn / APEX / fla` (no driver touch)
+#   - `importlib.util.find_spec(...)` (file-existence; does not execute module)
+#   - `importlib.metadata.distribution(...)` (reads *.dist-info)
+#   - file-content greps to verify our patches landed
+# Forbidden:
+#   - `import mamba_ssm` of any kind
+#   - `import megatron.bridge`
+# Real GPU smoke testing happens at container start via scripts/runtime_sanity.sh.
+# See memory.md Pitfall #13 for context.
 # ------------------------------------------------------------------------------
 RUN ${UV_PROJECT_ENVIRONMENT}/bin/python - <<'PYEOF'
 import sys
@@ -403,40 +418,72 @@ import megatron
 print(f"  ok      megatron.__path__                          {list(megatron.__path__)}")
 
 
-# --- Mamba/GDN runtime: real imports work without GPU thanks to the
-# patched mamba_ssm/__init__.py (selective_scan_cuda load is wrapped in
-# try/except). causal_conv1d's import does not touch the CUDA driver.
-# fla is pure Python.
-print()
-print("[Mamba/GDN runtime (baked-in)]")
-import_check("causal_conv1d")
-import_check("mamba_ssm")
-import_check("fla")
-# The path actually used by Qwen3.5-VL GDN — must be importable.
-import_check("mamba_ssm.ops.triton.ssd_combined", attr=None)
+# --- Mamba/GDN runtime: file-presence checks ONLY.
+#
+# Build host has NO GPU. Anything that touches a CUDA driver (Triton autotune,
+# selective_scan_cuda load, even some causal_conv1d codepaths) will fail
+# inside `docker build`. So here we restrict ourselves to filesystem checks
+# via importlib.util.find_spec (which does NOT execute the module).
+#
+# What this still catches at build time:
+#   - The wheel actually installed (file present)
+#   - The patched mamba_ssm/__init__.py was actually written (grep marker)
+#   - flash-linear-attention package metadata is registered
+# What this CANNOT catch (real import / GPU kernel):
+#   - Run scripts/runtime_sanity.sh inside a --gpus all container.
+#
+import importlib.util as _ilu
+from importlib.metadata import distribution as _dist, PackageNotFoundError as _PNFE
 
-# Confirm the ABI-mismatch fallback is in effect: selective_scan_fn must be
-# None inside the build container. If it's not None, the patch wasn't applied
-# and runtime would crash on `import mamba_ssm`.
-import mamba_ssm as _ms
-if _ms.selective_scan_fn is not None:
-    print("  warn    selective_scan_fn is NOT None — patch may not be needed (or torch ABI changed).")
-else:
-    print("  ok      mamba_ssm.selective_scan_fn=None              (NGC ABI fallback active, expected)")
-if _ms.Mamba2 is None:
-    print("  FAIL    mamba_ssm.Mamba2 is None — GDN path will not work")
+print()
+print("[Mamba/GDN runtime (baked-in, file-presence only — build host has no GPU)]")
+
+def _spec_check(name: str) -> bool:
+    spec = _ilu.find_spec(name)
+    if spec is None or (spec.submodule_search_locations is None and spec.origin is None):
+        print(f"  FAIL    {name:42s} not installed")
+        return False
+    where = spec.origin or list(spec.submodule_search_locations)[0]
+    print(f"  ok      {name:42s} present at {where}")
+    return True
+
+if not _spec_check("causal_conv1d"):
     ok = False
-else:
-    print("  ok      mamba_ssm.Mamba2 importable                   (GDN path live)")
+if not _spec_check("mamba_ssm"):
+    ok = False
+if not _spec_check("mamba_ssm.ops.triton.ssd_combined"):
+    ok = False
+
+# fla version via dist metadata (avoids actually importing it).
+try:
+    _fla_ver = _dist("flash-linear-attention").version
+    print(f"  ok      fla (flash-linear-attention)               {_fla_ver} (dist registered)")
+except _PNFE:
+    print("  FAIL    fla (flash-linear-attention)               distribution not registered")
+    ok = False
+
+# Verify the mamba_ssm/__init__.py patch actually landed.
+_mspec = _ilu.find_spec("mamba_ssm")
+if _mspec is not None and _mspec.origin:
+    with open(_mspec.origin) as _f:
+        _patched = "NGC nv25.06 patched torch" in _f.read()
+    if _patched:
+        print("  ok      mamba_ssm/__init__.py                      patched (NGC ABI fallback in place)")
+    else:
+        print("  FAIL    mamba_ssm/__init__.py                      NOT patched — runtime will crash")
+        ok = False
 
 print()
 print("=" * 60)
 if not ok:
     print("FAIL: critical checks failed; image is NOT usable")
     sys.exit(1)
-print("OK: build-time checks passed.")
-print("    causal_conv1d / mamba_ssm / fla are baked in. No runtime install needed.")
-print("    Run scripts/runtime_sanity.sh anytime to verify a live container.")
+print("OK: build-time checks passed (file-presence only).")
+print("    For a real GPU smoke test, run inside a --gpus all container:")
+print("       /opt/venv-mbridge/bin/python -c 'import mamba_ssm; \\")
+print("           from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined; \\")
+print("           print(mamba_ssm.__version__)'")
+print("    or use scripts/runtime_sanity.sh.")
 PYEOF
 
 # ------------------------------------------------------------------------------
