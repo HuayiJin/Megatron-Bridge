@@ -20,6 +20,9 @@ coverage.xml
 # IMPORTANT: do NOT exclude .git or 3rdparty/Megatron-LM — the Dockerfile
 # may need them to run `git submodule update --init` when the submodule is
 # uninitialised in the build context.
+# IMPORTANT: do NOT exclude docker/runtime_wheels/*.whl — Dockerfile.qwen35
+# COPY-installs causal_conv1d / mamba_ssm prebuilt wheels from there.
+# (See Dockerfile.qwen35 §"Bake mamba-ssm / causal-conv1d / fla into the image".)
 .venv
 build
 dist

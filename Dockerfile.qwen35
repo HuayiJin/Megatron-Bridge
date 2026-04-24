@@ -10,16 +10,29 @@
 #   - uv (package manager)
 #   - megatron-core (3rdparty/Megatron-LM submodule, editable)
 #   - megatron-bridge (this repo, editable)
-#   - mamba-ssm + causal-conv1d (Megatron Mamba/GDN backend)
-#   - flash-linear-attention (`fla`, GDN runtime)
+#   - causal-conv1d 1.6.1 + mamba-ssm 2.3.1 (prebuilt wheels, see workaround
+#     section below) + flash-linear-attention (`fla`, pure Python)
 #   - small Python deps tail from pyproject.toml
 #
 # Why NOT pin TE/torch/flash-attn/APEX:
 #   NGC ships matched, GPU-tested, performance-tuned versions. Replacing them
 #   either (a) downgrades performance, or (b) breaks ABI between TE-torch.
 #
-# Build:
-#   cd /data/temp/Megatron-Bridge
+# Build (run on the build host):
+#   # 1) Get the source + submodule
+#   git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+#   cd Megatron-Bridge
+#   git submodule update --init --recursive
+#
+#   # 2) Download the two prebuilt wheels mamba-ssm/causal-conv1d (~780 MB)
+#   mkdir -p docker/runtime_wheels && cd docker/runtime_wheels
+#   curl -fL -o causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+#     'https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
+#   curl -fL -o mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+#     'https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
+#   cd ../..
+#
+#   # 3) Build
 #   docker build -f Dockerfile.qwen35 -t qwen35-mbridge:cu129 .
 #
 # Run (mount source + HF weights + workspace):
@@ -210,18 +223,115 @@ RUN cd ${IMAGE_SRC_DIR} && \
         --no-deps -e .
 
 # ------------------------------------------------------------------------------
-# NOTE: mamba-ssm / causal-conv1d / fla are deliberately NOT installed at
-# build time. They:
-#   - Compile with nvcc and need 5-15 min build time per image
-#   - Touch CUDA driver at import; their build-time sanity would crash without
-#     a GPU attached to `docker build`
-#   - Add ~400MB to the image
-#   - Are easy to (re)install at first container start (we have GPU then)
+# Bake mamba-ssm / causal-conv1d / fla into the image (revised 2026-04-24).
 #
-# Instead, the entrypoint runs `scripts/install_runtime_deps.sh` on first
-# launch (idempotent, fast no-op once already installed). The user can also
-# run that script manually or pre-bake into a derived image if desired.
+# History — why we no longer source-build at runtime:
+#   1) The original plan was to defer `pip install mamba-ssm causal-conv1d fla`
+#      to first container launch, run by scripts/install_runtime_deps.sh.
+#   2) That source build takes 30+ min: mamba-ssm setup.py forces nvcc to
+#      compile 9 SM archs (sm_62..sm_120) serially, ignoring TORCH_CUDA_ARCH_LIST.
+#      ~95% of the compile time targets archs we don't have.
+#   3) We tried the upstream prebuilt wheels (cu12torch{2.8,2.9,2.10}cxx11abiTRUE
+#      cp312). NONE load cleanly on NGC nv25.06's torch 2.8a ABI:
+#         - torch2.8/2.9 wheel:  undefined c10::cuda::SetDevice(int8_t, bool)
+#         - torch2.10  wheel:    undefined c10::cuda::c10_cuda_check_implementation(..., bool)
+#      The NGC patched torch ABI sits between stock 2.9 and 2.10.
+#   4) BUT: only mamba_ssm's `selective_scan_cuda.so` extension trips. The
+#      Triton path used by Qwen3.5-VL GDN
+#      (mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined) is pure
+#      Python + Triton + causal_conv1d, and causal_conv1d's cu12torch2.8 wheel
+#      works fine. So if we make `import mamba_ssm` non-fatal when
+#      selective_scan_cuda fails to load, GDN still runs.
+#
+# What this section does:
+#   a) COPY two prebuilt wheels (~780 MB total) from docker/runtime_wheels/
+#      and pip-install them with --no-deps.
+#   b) pip-install fla (pure Python, no compile).
+#   c) Overwrite mamba_ssm/__init__.py with a try/except-guarded version so
+#      the failing CUDA-ext import becomes a one-line warning. Mamba1 paths
+#      (selective_scan_fn, mamba_inner_fn) are disabled, but Qwen3.5-VL
+#      doesn't use them.
+#
+# Wheel download (run on the build host before `docker build`):
+#   mkdir -p docker/runtime_wheels && cd docker/runtime_wheels
+#   curl -fL -o causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+#     'https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
+#   curl -fL -o mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+#     'https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
+#
+# See memory.md §"Mamba-SSM ABI Workaround" for full background.
 # ------------------------------------------------------------------------------
+
+ARG WHEELS_DIR=docker/runtime_wheels
+ARG CAUSAL_WHEEL=causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+ARG MAMBA_WHEEL=mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+
+# Fail-fast if the build host forgot to download the wheels.
+RUN test -d ${IMAGE_SRC_DIR}/${WHEELS_DIR} && \
+    test -f ${IMAGE_SRC_DIR}/${WHEELS_DIR}/${CAUSAL_WHEEL} && \
+    test -f ${IMAGE_SRC_DIR}/${WHEELS_DIR}/${MAMBA_WHEEL} || ( \
+        echo "ERROR: prebuilt wheels missing under ${IMAGE_SRC_DIR}/${WHEELS_DIR}"; \
+        echo "       Download them on the build host before docker build:"; \
+        echo "         curl -fL -o ${CAUSAL_WHEEL} \\"; \
+        echo "           'https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/${CAUSAL_WHEEL//+/%2B}'"; \
+        echo "         curl -fL -o ${MAMBA_WHEEL} \\"; \
+        echo "           'https://github.com/state-spaces/mamba/releases/download/v2.3.1/${MAMBA_WHEEL//+/%2B}'"; \
+        exit 1 ; \
+    )
+
+# Install causal_conv1d + mamba_ssm prebuilt wheels (no deps; ABI is matched
+# to NGC nv25.06 torch 2.8a as best we can).
+RUN ${UV_PROJECT_ENVIRONMENT}/bin/pip install --no-cache-dir --no-deps \
+        ${IMAGE_SRC_DIR}/${WHEELS_DIR}/${CAUSAL_WHEEL} \
+        ${IMAGE_SRC_DIR}/${WHEELS_DIR}/${MAMBA_WHEEL} && \
+    ${UV_PROJECT_ENVIRONMENT}/bin/pip install --no-cache-dir --no-deps \
+        flash-linear-attention==${FLA_VERSION}
+
+# Overwrite mamba_ssm/__init__.py to make the (intentionally) failing
+# selective_scan_cuda import non-fatal. This is what unblocks `import mamba_ssm`
+# despite the NGC torch ABI mismatch on selective_scan_cuda.so. The Qwen3.5-VL
+# GDN code path (mamba_ssm.ops.triton.ssd_combined) does NOT depend on it.
+RUN cat > ${UV_PROJECT_ENVIRONMENT}/lib/python3.12/site-packages/mamba_ssm/__init__.py <<'PYEOF'
+__version__ = "2.3.1"
+
+# NGC nv25.06 patched torch 2.8 has an ABI between stock torch 2.9 and 2.10,
+# so neither stock cu12torch2.8/2.9/2.10 prebuilt wheel matches:
+#   - torch2.8/2.9 wheel:  undefined c10::cuda::SetDevice(int8_t, bool)
+#   - torch2.10  wheel:    undefined c10::cuda::c10_cuda_check_implementation(..., bool)
+# The `selective_scan_cuda` extension is only used by the legacy
+# selective_scan_interface / Mamba1 / mamba_inner_fn paths. Megatron-Core's
+# Qwen3.5-VL GDN path uses mamba_ssm.ops.triton.ssd_combined which is pure
+# Python + Triton + causal_conv1d (the latter has a working wheel for our ABI).
+# So we make the legacy CUDA imports best-effort: keep them if they load, but
+# do not break `import mamba_ssm` if they don't.
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn  # noqa: F401
+except ImportError as _e:
+    selective_scan_fn = None
+    mamba_inner_fn = None
+    import warnings
+    warnings.warn(
+        "mamba_ssm.selective_scan_cuda failed to load (NGC torch ABI mismatch); "
+        "selective_scan_fn / mamba_inner_fn / Mamba1 will not work, but the "
+        "Triton-based mamba_ssm.ops.triton.ssd_combined path used by "
+        "megatron-core (Mamba2 / GDN) is unaffected. Original error: " + str(_e)
+    )
+
+try:
+    from mamba_ssm.modules.mamba_simple import Mamba  # noqa: F401
+except ImportError:
+    Mamba = None
+
+try:
+    from mamba_ssm.modules.mamba2 import Mamba2  # noqa: F401
+except ImportError:
+    Mamba2 = None
+
+try:
+    from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # noqa: F401
+except ImportError:
+    MambaLMHeadModel = None
+PYEOF
 
 # ------------------------------------------------------------------------------
 # Build-time sanity. Now that mamba_ssm / megatron.bridge are NOT in the image,
@@ -293,26 +403,31 @@ import megatron
 print(f"  ok      megatron.__path__                          {list(megatron.__path__)}")
 
 
-# --- Deferred deps: top-level filesystem-only check ---
-# Their import touches CUDA and would crash; we just look for the directory.
+# --- Mamba/GDN runtime: real imports work without GPU thanks to the
+# patched mamba_ssm/__init__.py (selective_scan_cuda load is wrapped in
+# try/except). causal_conv1d's import does not touch the CUDA driver.
+# fla is pure Python.
 print()
-print("[Deferred to runtime] (will be installed by entrypoint on first run)")
-import sys as _sys
-import os
+print("[Mamba/GDN runtime (baked-in)]")
+import_check("causal_conv1d")
+import_check("mamba_ssm")
+import_check("fla")
+# The path actually used by Qwen3.5-VL GDN — must be importable.
+import_check("mamba_ssm.ops.triton.ssd_combined", attr=None)
 
-
-def _find_top_dir(name):
-    for sp in _sys.path:
-        cand = os.path.join(sp, name)
-        if os.path.isdir(cand):
-            return cand
-    return None
-
-
-for name in ("mamba_ssm", "causal_conv1d", "fla"):
-    d = _find_top_dir(name)
-    status = "ALREADY INSTALLED" if d else "deferred"
-    print(f"  {status:18s}  {name:18s}  {d or ''}")
+# Confirm the ABI-mismatch fallback is in effect: selective_scan_fn must be
+# None inside the build container. If it's not None, the patch wasn't applied
+# and runtime would crash on `import mamba_ssm`.
+import mamba_ssm as _ms
+if _ms.selective_scan_fn is not None:
+    print("  warn    selective_scan_fn is NOT None — patch may not be needed (or torch ABI changed).")
+else:
+    print("  ok      mamba_ssm.selective_scan_fn=None              (NGC ABI fallback active, expected)")
+if _ms.Mamba2 is None:
+    print("  FAIL    mamba_ssm.Mamba2 is None — GDN path will not work")
+    ok = False
+else:
+    print("  ok      mamba_ssm.Mamba2 importable                   (GDN path live)")
 
 print()
 print("=" * 60)
@@ -320,8 +435,7 @@ if not ok:
     print("FAIL: critical checks failed; image is NOT usable")
     sys.exit(1)
 print("OK: build-time checks passed.")
-print("    First `docker run` will install mamba-ssm/causal-conv1d/fla via")
-print("    entrypoint; subsequent runs re-use them via /opt/venv-mbridge.")
+print("    causal_conv1d / mamba_ssm / fla are baked in. No runtime install needed.")
 print("    Run scripts/runtime_sanity.sh anytime to verify a live container.")
 PYEOF
 
