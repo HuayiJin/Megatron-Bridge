@@ -16,13 +16,35 @@ coverage.xml
 *.log
 **/*.nemo
 **/*.ckpt
-# Build artefacts — exclude to keep build context small
+# Build artefacts — exclude to keep build context small.
+# IMPORTANT: do NOT exclude .git or 3rdparty/Megatron-LM — the Dockerfile
+# may need them to run `git submodule update --init` when the submodule is
+# uninitialised in the build context.
 .venv
-.git/objects/pack
-3rdparty/Megatron-LM/.git/objects/pack
 build
 dist
 *.egg-info
 .pytest_cache
 .mypy_cache
 .ruff_cache
+node_modules
+
+# Local conversion / training artefacts
+/workspace/
+/runs/
+/checkpoints/
+**/*.distcp
+**/*.safetensors
+docker/build_logs/
+
+# IDE / OS junk
+.idea
+.vscode
+.DS_Store
+
+# Local secret / env files (defence in depth)
+.env
+.env.*
+*.pem
+*.key
+secrets.yaml

@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 # SFT entry point for Qwen3.5-122B-A10B with megatron-bridge.
 #
-# Wraps scripts/training/run_recipe.py with the exact patches required by this
-# environment (see /data/temp/Megatron-LM/memory.md):
-#   - nvidia.__file__ patch (TE 2.7 namespace package bug)
-#   - gradient_accumulation_fusion = False (no APEX)
-#   - torch.backends.cudnn.enabled = False (cuDNN sublib loading broken on host)
+# Wraps scripts/training/run_recipe.py with three optional patches that are
+# toggleable via environment variables. In the NGC-based container all
+# defaults are no-ops because NGC ships TE 2.4 + cuDNN 9.10 + APEX cuda ext.
+#
+# Env toggles (default value for the NGC container in parens):
+#   MBRIDGE_PATCH_NVIDIA_FILE = 0    Patch nvidia.__file__ (TE 2.7 namespace bug)
+#   MBRIDGE_DISABLE_CUDNN     = 0    torch.backends.cudnn.enabled = False
+#   MBRIDGE_PATCH_GRAD_FUSION = 0    Force gradient_accumulation_fusion = False
+#
+# When NGC ships APEX (the default for 25.06+), the recipe's default
+# `gradient_accumulation_fusion=True` works correctly and you should NOT
+# pass `model.gradient_accumulation_fusion=false` on the CLI.
 #
 # Usage (single-node 8 GPU smoke):
 #   bash scripts/run_sft_qwen35_122b.sh smoke
@@ -18,33 +25,36 @@
 #   - dataset = vlm-hf with cord_v2 (small public OCR dataset, fits in HF cache)
 #   - MTP enabled (mtp_num_layers=1, mtp_loss_scaling_factor=0.1)
 #   - pack_sequences_in_batch=False (REQUIRED — GDN does not support THD)
-#   - gradient_accumulation_fusion=False (override; recipe default True)
 
 import os
 import sys
 
-# === Patch 0: TE 2.7 expects nvidia.__file__ to be a real path ===
-import nvidia as _nvidia_ns
 
-if getattr(_nvidia_ns, "__file__", None) is None and getattr(_nvidia_ns, "__path__", None):
-    _nvidia_ns.__file__ = os.path.join(list(_nvidia_ns.__path__)[0], "__init__.py")
-    print(f"[sft] patched nvidia.__file__ -> {_nvidia_ns.__file__}", flush=True)
+def _truthy(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
 
-# === Patch 0.5: cuDNN sublib loading broken; fall back to native conv ===
-import torch as _torch
 
-_torch.backends.cudnn.enabled = False
-print("[sft] patched torch.backends.cudnn.enabled = False", flush=True)
+# === Patch 0: nvidia.__file__ (TE 2.7 namespace package crash) ===
+if _truthy("MBRIDGE_PATCH_NVIDIA_FILE"):
+    import nvidia as _nvidia_ns
 
-# === Patch 1: gradient_accumulation_fusion requires APEX (not installed) ===
-from megatron.bridge.utils import fusions as _fusions
+    if getattr(_nvidia_ns, "__file__", None) is None and getattr(_nvidia_ns, "__path__", None):
+        _nvidia_ns.__file__ = os.path.join(list(_nvidia_ns.__path__)[0], "__init__.py")
+        print(f"[sft] patched nvidia.__file__ -> {_nvidia_ns.__file__}", flush=True)
 
-_fusions.can_enable_gradient_accumulation_fusion = lambda: False
-print("[sft] patched can_enable_gradient_accumulation_fusion -> False", flush=True)
+# === Patch 1: cuDNN disable (bare-metal sublib loading bug) ===
+if _truthy("MBRIDGE_DISABLE_CUDNN"):
+    import torch as _torch
 
-# Ensure the recipe override below also disables fusion. The recipe sets
-# `cfg.model.gradient_accumulation_fusion = True` after building the provider;
-# we will pass `model.gradient_accumulation_fusion=false` via CLI overrides.
+    _torch.backends.cudnn.enabled = False
+    print("[sft] cuDNN disabled via MBRIDGE_DISABLE_CUDNN=1", flush=True)
+
+# === Patch 2: gradient_accumulation_fusion = False (no APEX) ===
+if _truthy("MBRIDGE_PATCH_GRAD_FUSION"):
+    from megatron.bridge.utils import fusions as _fusions
+
+    _fusions.can_enable_gradient_accumulation_fusion = lambda: False
+    print("[sft] forced gradient_accumulation_fusion=False (no APEX)", flush=True)
 
 # Now hand off to the official entry point. It uses argparse so the rest of our
 # argv is consumed there.

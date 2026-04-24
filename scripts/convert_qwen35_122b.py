@@ -41,10 +41,13 @@ def main() -> int:
     print(f"🔧 Building Megatron provider")
     provider = bridge.to_megatron_provider(load_weights=True)
 
-    # === Workaround: disable gradient_accumulation_fusion (no APEX in venv) ===
+    # Conversion is a CPU-init, single-process workflow that never trains;
+    # gradient_accumulation_fusion is irrelevant here. We always disable it
+    # to avoid a runtime check in ColumnParallelLinear that requires APEX
+    # (the check fires even though we never compute gradients).
     if hasattr(provider, "gradient_accumulation_fusion"):
-        print("   ⚙️  Disabling gradient_accumulation_fusion (no APEX cuda ext)")
         provider.gradient_accumulation_fusion = False
+        print("   ⚙️  gradient_accumulation_fusion=False (irrelevant for CPU conversion)")
 
     # === Conversion-only: single-process, EP/PP/TP all = 1 (default) ===
     # The mcore ckpt layout is parallelism-agnostic for torch_dist.

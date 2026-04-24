@@ -223,4 +223,65 @@ uv run python -m torch.distributed.run --nproc_per_node=8 \
 
 ---
 
+## 10. 镜像构建决策 (2026-04-24)
+
+### 用户需求
+- Base 选 NGC PyTorch **`25.06-py3`** (CUDA 12.9.1 + Torch 2.8.0a0 + cuDNN 9 + TensorRT 10.11)
+- CUDA 12.x 取最新(即 12.9.1,**不再装 cu13**)
+- 镜像构建后**直接可用**(开箱即用 SFT)
+
+### 重构后 Dockerfile.qwen35 关键改动
+| 改动 | 原 | 新 | 原因 |
+|---|---|---|---|
+| Torch 安装 | `pip install torch==2.8.* cu128` | **不动**,继承 NGC 自带 | NGC 自带优化版,cu128 wheel 会降级 + 库混乱 |
+| TE 安装 | `pip install transformer-engine==2.7.*` | **优先继承 NGC**,`uv sync` 跳过 | NGC 自带 TE 通常已优化 |
+| cuDNN | `pin nvidia-cudnn-cu12==9.10.2.21` | **不装**,用系统 cuDNN 9 | 之前的 sublib loading 错就是版本错乱;NGC 内自洽 |
+| flash-attn / mamba-ssm / causal-conv1d | 强行重编 | **优先 NGC**,`uv sync` 跳过 | NGC 通常已带预编版,可省 30-60 min build 时间 |
+| APEX | 不装 | **build-time 检测**,无则源码编译(可 `--build-arg BUILD_APEX_IF_MISSING=0` 关闭) | APEX 装上后可干掉 `gradient_accumulation_fusion=False` patch |
+| Source 映射 | `/opt/build/Megatron-Bridge` 与运行时挂载脱钩 | **`/opt/Megatron-Bridge` fallback + entrypoint 检测 `/workspace/Megatron-Bridge` 挂载优先** | 既能开箱即用,也能挂宿主机源码热改 |
+| venv 路径 | `/opt/venv`(可能与 NGC 冲突) | **`/opt/venv-mbridge`**(独立) | 避免与 NGC 自带 `/opt/venv` 撞名 |
+
+### 配套文件
+- `docker/entrypoint-mbridge.sh` 实现"挂载优先 + 自动 reinstall editable + 自动 init submodule"
+- `.dockerignore` 调整:不再屏蔽 `.git`(让 build 期能 `git submodule update --init`)
+
+### 实施进度
+1. ✅ `docker pull nvcr.io/nvidia/pytorch:25.06-py3`(用户已完成)
+2. ✅ **探镜像完成**(2026-04-24)— 结果如下表
+3. ✅ Dockerfile 已精确化
+4. ⏳ `docker build -f Dockerfile.qwen35 -t qwen35-mbridge:cu129 .`(用户待执行)
+5. ⏳ 镜像内 sanity + 容器内 smoke
+
+### 探镜像结果(NGC PyTorch 25.06-py3)
+
+| 组件 | 版本 | 我们的处理 |
+|---|---|---|
+| Python | 3.12.3 (`/usr/bin/python`) | 用之 |
+| PyTorch | **2.8.0a0+5228986c39.nv25.06** / cuda 12.9 / cuDNN 91002 | 继承,绝不装 |
+| TransformerEngine | **2.4.0+3cd6870** | 继承(注意:不是 2.7,与之前裸机不同) |
+| cuDNN libs | `/usr/lib/x86_64-linux-gnu/libcudnn*.so.9.10.2` | 系统级,继承 |
+| flash-attn | **2.7.4.post1** | 继承(版本略低于 2.8.1,需观察 Qwen3.5-VL 是否兼容) |
+| **APEX cuda ext** | **OK** (`fused_weight_gradient_mlp_cuda` + `FusedRMSNorm`) | 继承,**所有 grad-fusion patch 默认 no-op** |
+| mamba-ssm | ❌ 没装 | Dockerfile 装 `==2.3.1` |
+| causal-conv1d | ❌ 没装 | Dockerfile 装 `==1.6.1` |
+| fla | ❌ 没装 | Dockerfile 装 `==0.4.2` (`flash-linear-attention`) |
+| megatron-core | ❌ 没装 | submodule editable |
+| uv | ❌ 没装 | Dockerfile 装 `0.9.18` |
+| nvcc | 12.9 | 系统级 |
+
+### NGC 容器内 monkey-patch 默认状态(全部 no-op)
+
+所有 wrapper 脚本(`scripts/{convert,smoke,sft}_qwen35_122b.py`)的 patch 改为 **环境变量开关**:
+
+| 环境变量 | 默认 | 行为 |
+|---|---|---|
+| `MBRIDGE_PATCH_NVIDIA_FILE` | `0` (NGC 容器) | NGC TE 2.4 没有 namespace 问题,无需 patch |
+| `MBRIDGE_DISABLE_CUDNN` | `0` (NGC 容器) | NGC cuDNN 9.10 健康,**保留 cuDNN** 让 ViT Conv3d 走优化路径 |
+| `MBRIDGE_PATCH_GRAD_FUSION` | `0` (NGC 容器) | NGC APEX cuda ext 齐全,recipe 默认 `gradient_accumulation_fusion=True` 直接可用 |
+
+**裸机回退**: 在主 conda 环境(无 APEX,有 cuDNN 子库 bug)运行时,需要 `export MBRIDGE_PATCH_NVIDIA_FILE=1 MBRIDGE_DISABLE_CUDNN=1 MBRIDGE_PATCH_GRAD_FUSION=1`。
+Dockerfile 默认 `MBRIDGE_DISABLE_CUDNN=0`(其他两个 Python 默认就是 0)。
+
+---
+
 _最后更新: 2026-04-23 (build mode 启动时初始化)_

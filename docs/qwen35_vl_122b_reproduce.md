@@ -44,6 +44,29 @@ verl demo (`run_qwen3_5-122b-a10b-megatron.sh`) 用的是 `mbridge`(因为 verl 
 
 ## 1. 一次性环境构建
 
+> **推荐路径**:用 `Dockerfile.qwen35` 构建容器镜像(基于 NGC PyTorch 25.06,
+> CUDA 12.9.1 + Torch 2.8.0a0 + cuDNN 9 + TE)。所有依赖由 NGC 镜像提供,
+> 我们只追加 megatron-core/megatron-bridge editable + 必要 Python 包。
+>
+> ```bash
+> cd /data/temp/Megatron-Bridge
+> # (一次性) 拉取 NGC 镜像 ~30GB
+> docker pull nvcr.io/nvidia/pytorch:25.06-py3
+> # 构建项目镜像 (~5-15 min)
+> docker build -f Dockerfile.qwen35 -t qwen35-mbridge:cu129 .
+> # 进容器 (源码挂载优先, 修改即时生效)
+> docker run --rm -it --gpus all --shm-size=64g --ulimit memlock=-1 --network host \
+>   -v "$PWD":/workspace/Megatron-Bridge \
+>   -v /mnt/tidal-alsh01/dataset/redone/checkpoints/opensource:/models:ro \
+>   -v /data/temp/workspace:/workspace/runs \
+>   qwen35-mbridge:cu129 bash
+> ```
+>
+> 详细 build/run 说明见 `Dockerfile.qwen35` 顶部注释。
+> 若想直接在裸机调试(不用容器),按下面步骤手动配置 venv。
+
+### 1.1 裸机 venv 路径(已不推荐,仅用于历史对照)
+
 ```bash
 # 仓库与 submodule
 cd /data/temp/Megatron-Bridge
