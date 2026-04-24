@@ -263,31 +263,56 @@ import_check("flash_attn")
 import_check("fused_weight_gradient_mlp_cuda", attr=None)  # APEX cuda ext
 import_check("apex.normalization", attr=None, critical=False)
 
-# --- megatron-core editable install: file existence (importing megatron.core
-# eagerly imports submodules that may touch CUDA; verify presence only) ---
+# --- Project / editable installs: registration check WITHOUT executing
+# any sub-package's __init__.py.
+#
+# Background: `import megatron.bridge` would chain into triton autotuner
+# (via emerging_optimizers) which calls `driver.active.get_benchmarker()`,
+# crashing with "0 active drivers" inside docker build (no GPU).
+#
+# We instead query distribution metadata via `importlib.metadata`. If the
+# editable install succeeded in STEP 17, the distribution is registered and
+# we can read its version + the `*.pth` entry that points at the source.
 print()
-print("[Project files]")
-import importlib.util
+print("[Editable installs (registration check, no module execution)]")
+from importlib.metadata import distribution, PackageNotFoundError
 
-for name in ("megatron", "megatron.core", "megatron.bridge",
-             "megatron.bridge.models.qwen_vl.qwen35_vl_bridge",
-             "megatron.bridge.recipes.qwen_vl"):
-    spec = importlib.util.find_spec(name)
-    if spec is None:
-        print(f"  FAIL    {name:42s} (not installed)")
+for dist_name in ("megatron-core", "megatron-bridge"):
+    try:
+        d = distribution(dist_name)
+        ver = d.version
+        loc = str(d.locate_file(""))
+        print(f"  ok      {dist_name:42s} {ver}  ({loc})")
+    except PackageNotFoundError:
+        print(f"  FAIL    {dist_name:42s} (distribution not registered)")
         ok = False
-    else:
-        origin = spec.origin or (spec.submodule_search_locations[0]
-                                  if spec.submodule_search_locations else "<namespace>")
-        print(f"  found   {name:42s} {origin}")
 
-# --- Note on deferred deps ---
+# `megatron` itself is a PEP 420 namespace package — `import megatron` does
+# NOT execute any code (no __init__.py), so it's safe to verify the path.
+import megatron
+print(f"  ok      megatron.__path__                          {list(megatron.__path__)}")
+
+
+# --- Deferred deps: top-level filesystem-only check ---
+# Their import touches CUDA and would crash; we just look for the directory.
 print()
 print("[Deferred to runtime] (will be installed by entrypoint on first run)")
+import sys as _sys
+import os
+
+
+def _find_top_dir(name):
+    for sp in _sys.path:
+        cand = os.path.join(sp, name)
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
 for name in ("mamba_ssm", "causal_conv1d", "fla"):
-    spec = importlib.util.find_spec(name)
-    status = "ALREADY INSTALLED" if spec else "deferred"
-    print(f"  {status:18s}  {name}")
+    d = _find_top_dir(name)
+    status = "ALREADY INSTALLED" if d else "deferred"
+    print(f"  {status:18s}  {name:18s}  {d or ''}")
 
 print()
 print("=" * 60)
