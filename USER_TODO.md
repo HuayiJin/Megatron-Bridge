@@ -107,11 +107,19 @@ cd /data/temp/Megatron-Bridge
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.qwen35 -t qwen35-mbridge:cu129 .
 ```
 
-预计耗时:
+预计耗时(精简后):
 - COPY 源码 + uv venv:1-2 min
 - `uv sync`:2-3 min(只装小 Python 包,跳过所有 cuda 大件)
-- 编译 `mamba-ssm` + `causal-conv1d`:**5-15 min** ← 主要时间消耗(nvcc 编译)
-- build-time sanity:30 sec
+- megatron-bridge editable install:30 sec
+- build-time sanity(纯 import,无 GPU):30 sec
+- **总计 ~3-5 min**
+
+> **mamba-ssm / causal-conv1d / fla 不在镜像里**(build 期没 GPU 装不了 mamba-ssm),
+> 由 entrypoint 在首次 `docker run` 时自动装(~5-15 min),后续启动复用 venv。
+> 想完全避开这次启动等待,把 venv 持久化到挂载卷:
+> ```bash
+> docker run ... -v /shared/qwen35-venv:/opt/venv-mbridge ...
+> ```
 
 构建过程中如果某个 import 失败,build 会立即终止并打印 traceback,把它贴回来。
 
@@ -173,18 +181,29 @@ docker images qwen35-mbridge:cu129  # 验证有了
 ### Task 7: 进容器,验证转换 + smoke 推理
 
 ```bash
+# 推荐:venv 持久化到宿主机一个目录,首次启动后避免重复安装 mamba-ssm 等
+mkdir -p /data/temp/qwen35-venv
 docker run --rm -it --gpus all --shm-size=64g --ulimit memlock=-1 \
   --network host \
   -v /data/temp/Megatron-Bridge:/workspace/Megatron-Bridge \
   -v /mnt/tidal-alsh01/dataset/redone/checkpoints/opensource:/models:ro \
   -v /data/temp/workspace:/workspace/runs \
+  -v /data/temp/qwen35-venv:/opt/venv-mbridge \
   qwen35-mbridge:cu129 bash
 ```
+
+**首次启动**:entrypoint 会自动跑 `install_runtime_deps.sh`,装 mamba-ssm + causal-conv1d + fla
+(~5-15 min)。看到 `[install_runtime_deps] done.` 后才出 prompt。
+
+**后续启动**(同一个 venv 挂载点):entrypoint 检测到已装,跳过,~1 sec。
 
 进容器后:
 
 ```bash
-# 已有的 mcore ckpt 在 /workspace/runs/models/Qwen3.5-122B-A10B-mcore (从宿主机挂载)
+# 0. (可选)显式 sanity 一遍, 确认所有运行时依赖
+bash scripts/runtime_sanity.sh
+
+# 1. 已有的 mcore ckpt 在 /workspace/runs/models/... (从宿主机挂载)
 # 直接跑 smoke 验证容器内 8 卡推理
 HF_MODEL=/models/Qwen3.5-122B-A10B \
 MCORE_PATH=/workspace/runs/models/Qwen3.5-122B-A10B-mcore/iter_0000000 \

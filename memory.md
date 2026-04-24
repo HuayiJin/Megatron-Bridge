@@ -322,6 +322,40 @@ Dockerfile 默认 `MBRIDGE_DISABLE_CUDNN=0`(其他两个 Python 默认就是 0)�
 
 ---
 
+## 12.5 Runtime-deferred 依赖策略 (2026-04-24)
+
+### 决策
+将 `mamba-ssm` / `causal-conv1d` / `fla` **从镜像移出**,改为容器启动时安装。
+
+### 动机
+1. **build 期没 GPU**: `import mamba_ssm` 在 docker build 阶段触发 `RuntimeError: 0 active drivers` —— mamba-ssm 在 import 时探测 CUDA driver。这导致 build-time sanity 必须用 `find_spec` 兜底,体验差。
+2. **build 时间**: 这两个 nvcc 编译占总 build 时间 70%+(5-15 min),挪到 runtime 后 build 缩到 3-5 min。
+3. **镜像体积**: 这三个包 + nvcc 中间产物约 400MB。
+4. **灵活性**: 想换 mamba-ssm 版本不用 rebuild 镜像。
+
+### 实现
+- `Dockerfile.qwen35` 删除 STEP 19 (mamba/causal-conv1d 安装) 和 STEP 18 (fla 安装)
+- 新增 `scripts/install_runtime_deps.sh` —— 幂等安装脚本
+- `docker/entrypoint-mbridge.sh` 启动时**自动调用** install_runtime_deps.sh
+- Build sanity 改回**全部真 import**(因 mamba_ssm 不在了)
+- Runtime sanity 检测缺失则提示用户跑 install 脚本
+
+### 性能优化:venv 持久化
+首次启动等 5-15 min,后续避免重装的方法:
+```bash
+docker run ... -v /shared/qwen35-venv:/opt/venv-mbridge ...
+```
+把整个 venv site-packages 挂到宿主机,跨容器复用。
+
+### 关闭自动安装(如要镜像内手动)
+```bash
+docker run -e MBRIDGE_SKIP_RUNTIME_INSTALL=1 ...
+# 然后在容器内手动:
+bash scripts/install_runtime_deps.sh
+```
+
+---
+
 ## 12. Dockerfile submodule 检测 fix (2026-04-24)
 
 ### 症状

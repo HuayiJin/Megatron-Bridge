@@ -123,9 +123,14 @@ docker pull nvcr.io/nvidia/pytorch:25.06-py3
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.qwen35 -t qwen35-mbridge:cu129 .
 ```
 
-预计耗时 10-22 分钟(主消耗在 mamba-ssm/causal-conv1d nvcc 编译)。
+预计耗时 **3-5 分钟**(精简后:mamba-ssm/causal-conv1d/fla 不在镜像里,改为容器启动时装)。
 
-构建成功的标志:Dockerfile sanity 步骤打印 `OK: image is ready to use`,且最后 `docker images qwen35-mbridge:cu129` 看到镜像 ~35GB。
+构建成功的标志:Dockerfile sanity 步骤打印 `OK: build-time checks passed.`,且 `docker images qwen35-mbridge:cu129` 看到镜像约 31-32GB(比 NGC base 大 1-2GB,主要是 megatron-bridge 源码 + Python 小包)。
+
+> **运行时依赖**: 第一次 `docker run --gpus all` 时 entrypoint 会自动跑 `scripts/install_runtime_deps.sh`,装 mamba-ssm + causal-conv1d + fla(~5-15 min,nvcc 编译 + GPU 探测)。建议把 venv 挂到宿主机持久化目录,避免每次重装:
+> ```bash
+> docker run ... -v /shared/qwen35-venv:/opt/venv-mbridge ...
+> ```
 
 ---
 

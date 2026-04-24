@@ -45,8 +45,9 @@ ARG MOUNT_SRC_DIR=/workspace/Megatron-Bridge
 # venv path (independent from any /opt/venv that NGC may ship)
 ARG VENV_DIR=/opt/venv-mbridge
 
-# Pinned versions for the four packages NGC does not ship.
-# These are the same versions we successfully ran on bare metal.
+# Pinned versions for the runtime-deferred packages (NGC does not ship them;
+# entrypoint installs them on first launch via scripts/install_runtime_deps.sh).
+# Override at `docker run -e MAMBA_SSM_VERSION=2.4.0` to upgrade without rebuild.
 ARG MAMBA_SSM_VERSION=2.3.1
 ARG CAUSAL_CONV1D_VERSION=1.6.1
 ARG FLA_VERSION=0.4.2
@@ -67,9 +68,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MBRIDGE_IMAGE_SRC_DIR=${IMAGE_SRC_DIR} \
     MBRIDGE_MOUNT_SRC_DIR=${MOUNT_SRC_DIR} \
     MBRIDGE_VENV_DIR=${VENV_DIR} \
-    # NGC ships a healthy cuDNN 9.10.2 — opt out of the bare-metal
-    # "disable cuDNN" workaround in the wrapper scripts.
-    MBRIDGE_DISABLE_CUDNN=0
+    # NGC ships a healthy cuDNN 9; opt out of the bare-metal "disable cuDNN"
+    # workaround. Override at `docker run -e MBRIDGE_DISABLE_CUDNN=1` if needed.
+    MBRIDGE_DISABLE_CUDNN=0 \
+    # Runtime-deferred dep versions (read by scripts/install_runtime_deps.sh)
+    MAMBA_SSM_VERSION=${MAMBA_SSM_VERSION} \
+    CAUSAL_CONV1D_VERSION=${CAUSAL_CONV1D_VERSION} \
+    FLA_VERSION=${FLA_VERSION}
 
 # ------------------------------------------------------------------------------
 # OS deps that NGC may not ship explicitly
@@ -205,98 +210,94 @@ RUN cd ${IMAGE_SRC_DIR} && \
         --no-deps -e .
 
 # ------------------------------------------------------------------------------
-# Install fla (flash-linear-attention) — GDN runtime kernel library.
-# Pure Python wheel, fast install.
-# ------------------------------------------------------------------------------
-RUN UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} \
-    uv pip install --link-mode copy --python ${UV_PROJECT_ENVIRONMENT}/bin/python \
-        --no-deps "flash-linear-attention==${FLA_VERSION}"
-
-# ------------------------------------------------------------------------------
-# Install mamba-ssm + causal-conv1d — both must be built against the inherited
-# torch (NGC ships 2.8.0a0+nv25.06). Build with --no-build-isolation so they
-# pick up the system torch instead of pulling a fresh one.
+# NOTE: mamba-ssm / causal-conv1d / fla are deliberately NOT installed at
+# build time. They:
+#   - Compile with nvcc and need 5-15 min build time per image
+#   - Touch CUDA driver at import; their build-time sanity would crash without
+#     a GPU attached to `docker build`
+#   - Add ~400MB to the image
+#   - Are easy to (re)install at first container start (we have GPU then)
 #
-# These extensions take ~5-15 minutes to compile; the bottleneck is causal-
-# conv1d's nvcc compile. They use the same nvcc 12.9 NGC ships.
+# Instead, the entrypoint runs `scripts/install_runtime_deps.sh` on first
+# launch (idempotent, fast no-op once already installed). The user can also
+# run that script manually or pre-bake into a derived image if desired.
 # ------------------------------------------------------------------------------
-RUN UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} \
-    uv pip install --link-mode copy --python ${UV_PROJECT_ENVIRONMENT}/bin/python \
-        --no-build-isolation --no-deps \
-        "causal-conv1d==${CAUSAL_CONV1D_VERSION}" \
-        "mamba-ssm==${MAMBA_SSM_VERSION}"
 
 # ------------------------------------------------------------------------------
-# Build-time sanity (no GPU access; pure imports). Halts the build on any
-# critical failure so the image is guaranteed importable.
+# Build-time sanity. Now that mamba_ssm / megatron.bridge are NOT in the image,
+# we can do real imports for everything that IS installed without GPU.
 # ------------------------------------------------------------------------------
 RUN ${UV_PROJECT_ENVIRONMENT}/bin/python - <<'PYEOF'
 import sys
+import importlib
 
 print("=" * 60)
-print("Build-time sanity checks")
+print("Build-time sanity (no-GPU)")
 print("=" * 60)
 
 ok = True
 
-def check(name: str, attr: str = "__version__", critical: bool = True):
+
+def import_check(name: str, attr: str = "__version__", critical: bool = True) -> bool:
     global ok
     try:
-        m = __import__(name)
-        for part in name.split(".")[1:]:
-            m = getattr(m, part)
+        m = importlib.import_module(name)
         v = getattr(m, attr, "<no version>") if attr else "ok"
-        print(f"  ok    {name:35s} {v}")
+        print(f"  ok      {name:42s} {v}")
         return True
     except Exception as exc:
-        print(f"  {'FAIL' if critical else 'warn'}  {name:35s} {type(exc).__name__}: {exc}")
+        label = "FAIL" if critical else "warn"
+        print(f"  {label:6s}  {name:42s} {type(exc).__name__}: {exc}")
         if critical:
             ok = False
         return False
 
-# Inherited from NGC
-check("torch")
-check("transformer_engine")
-check("transformer_engine.pytorch", attr=None)
-check("flash_attn")
-check("fused_weight_gradient_mlp_cuda", attr=None)  # APEX cuda ext
-check("apex.normalization", attr=None, critical=False)
 
-# Installed by us
-check("mamba_ssm")
-check("causal_conv1d")
-check("fla")
-check("megatron.core")
-check("megatron.bridge")
+# --- NGC-provided libs (real import works without GPU) ---
+print()
+print("[NGC libs]")
+import_check("torch")
+import_check("transformer_engine")
+import_check("transformer_engine.pytorch", attr=None)
+import_check("flash_attn")
+import_check("fused_weight_gradient_mlp_cuda", attr=None)  # APEX cuda ext
+import_check("apex.normalization", attr=None, critical=False)
 
-# Project-critical entry points
-try:
-    from megatron.bridge import AutoBridge  # noqa: F401
-    print("  ok    megatron.bridge.AutoBridge importable")
-except Exception as exc:
-    print(f"  FAIL  AutoBridge: {exc}")
-    ok = False
+# --- megatron-core editable install: file existence (importing megatron.core
+# eagerly imports submodules that may touch CUDA; verify presence only) ---
+print()
+print("[Project files]")
+import importlib.util
 
-try:
-    from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLMoEBridge  # noqa: F401
-    print("  ok    Qwen35VLMoEBridge importable")
-except Exception as exc:
-    print(f"  FAIL  Qwen35VLMoEBridge: {exc}")
-    ok = False
+for name in ("megatron", "megatron.core", "megatron.bridge",
+             "megatron.bridge.models.qwen_vl.qwen35_vl_bridge",
+             "megatron.bridge.recipes.qwen_vl"):
+    spec = importlib.util.find_spec(name)
+    if spec is None:
+        print(f"  FAIL    {name:42s} (not installed)")
+        ok = False
+    else:
+        origin = spec.origin or (spec.submodule_search_locations[0]
+                                  if spec.submodule_search_locations else "<namespace>")
+        print(f"  found   {name:42s} {origin}")
 
-# Recipe constructibility (lightweight: just imports, no model build)
-try:
-    from megatron.bridge.recipes.qwen_vl import qwen35_vl_122b_a10b_sft_config  # noqa: F401
-    print("  ok    qwen35_vl_122b_a10b_sft_config recipe importable")
-except Exception as exc:
-    print(f"  FAIL  recipe import: {exc}")
-    ok = False
+# --- Note on deferred deps ---
+print()
+print("[Deferred to runtime] (will be installed by entrypoint on first run)")
+for name in ("mamba_ssm", "causal_conv1d", "fla"):
+    spec = importlib.util.find_spec(name)
+    status = "ALREADY INSTALLED" if spec else "deferred"
+    print(f"  {status:18s}  {name}")
 
+print()
 print("=" * 60)
 if not ok:
-    print("FAIL: critical imports failed; image is NOT usable")
+    print("FAIL: critical checks failed; image is NOT usable")
     sys.exit(1)
-print("OK: image is ready to use")
+print("OK: build-time checks passed.")
+print("    First `docker run` will install mamba-ssm/causal-conv1d/fla via")
+print("    entrypoint; subsequent runs re-use them via /opt/venv-mbridge.")
+print("    Run scripts/runtime_sanity.sh anytime to verify a live container.")
 PYEOF
 
 # ------------------------------------------------------------------------------
