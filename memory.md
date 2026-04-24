@@ -84,23 +84,25 @@ Image: built from `Dockerfile.qwen35`, base `nvcr.io/nvidia/pytorch:25.06-py3`
 
 ```bash
 # On EACH node, inside the container:
-cd /mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge
-
-# (Once per fresh container)
-bash scripts/install_runtime_deps.sh
+cd /mnt/tidal-alsh01/dataset/redone/hade/dd
 
 # Node 0 (master):
 tmux new -s sft -d
-tmux send-keys -t sft "RANK=0 bash scripts/run_sft_qwen35_122b_2node_lora.sh" C-m
+tmux send-keys -t sft "RANK=0 MASTER_PORT=23456 bash start.sh" C-m
 
 # Node 1 (worker):
 tmux new -s sft -d
-tmux send-keys -t sft "RANK=1 bash scripts/run_sft_qwen35_122b_2node_lora.sh" C-m
+tmux send-keys -t sft "RANK=1 MASTER_PORT=23456 bash start.sh" C-m
 ```
 
-`MASTER_ADDR`, `MASTER_PORT`, `WORLD_SIZE` come from the cluster scheduler;
-the script only needs you to set `RANK` per node (or trust whatever the
-scheduler injected — the master sees `RANK=0`).
+**Always pass `MASTER_PORT=23456` explicitly** — the master's container
+sometimes inherits a stale value (`23964`) while the worker correctly sees
+`23456`. If they don't match, torchrun rendezvous hangs silently forever
+with no error message. See Pitfall #11 for symptoms.
+
+`MASTER_ADDR`, `WORLD_SIZE` come from the cluster scheduler.
+`RANK` you set per node (or trust whatever the scheduler injected — the
+master sees `RANK=0`).
 
 Inside-container env vars (defaults, override with `docker run -e ...`):
 
@@ -150,6 +152,8 @@ left alone.
 | 8 | `gradient_accumulation_fusion=False` left over from old bare-metal scripts | Inside the NGC container, this *hurts* performance (APEX is fine). Don't override it. |
 | 9 | `mamba_ssm` source build takes 30+ min | mamba-ssm `setup.py` ignores `TORCH_CUDA_ARCH_LIST` and forces compile of 9 SM archs (sm_62..sm_120) serially. Use prebuilt wheel + `__init__.py` patch — see §Mamba ABI Workaround below. |
 | 10 | NGC nv25.06 torch ABI is between stock 2.9 and 2.10 | NVIDIA backported some `c10::cuda::*` symbols. *No* stock `mamba_ssm` prebuilt wheel from upstream resolves cleanly. Workaround: install the `cu12torch2.8` wheel (its `selective_scan_cuda.so` won't load) + patch `mamba_ssm/__init__.py` to make that failure non-fatal. The Triton path used by Qwen3.5-VL GDN doesn't depend on `selective_scan_cuda`. Details in §Mamba ABI Workaround. |
+| 11 | `MASTER_PORT` differs across nodes in this cluster (master saw `23964`, worker saw `23456`) | Two-node rendezvous silently hangs forever with no error. The cluster's true default is **23456** — always pass `MASTER_PORT=23456` explicitly when launching `start.sh` if you can't trust the per-node injected value. Symptom: torchrun process alive, 65 threads, sleeping; no worker fork; both nodes look "stuck after OMP banner". |
+| 12 | torchrun gives no output for 6–15 min after the OMP banner | NORMAL. Sequence: (a) rendezvous (~10 s), (b) `import megatron.bridge` per rank (60–180 s, fully silent), (c) 234 GB mcore ckpt mmap+load across 16 ranks (3–10 min), (d) iter 1 cold compile+forward+backward (1–3 min). Watch `nvidia-smi` GPU memory rising as a liveness signal; first `iter 1 loss=...` line marks success. |
 
 ## Mamba-SSM ABI Workaround (NGC nv25.06)
 
@@ -319,7 +323,7 @@ this path.
 | A. Env on cluster (NGC container) | ✅ Done | `/opt/venv-mbridge/bin/python` works, all NGC libs OK |
 | B. HF → mcore conversion | ✅ Done (pre-existing, 234 GB) | `/mnt/tidal-alsh01/dataset/redone/hade/data/Qwen3.5-122B-A10B-mcore` |
 | C. mcore ckpt offline structure verify | ⏳ TBD this session | `scripts/verify_mcore_ckpt.py` |
-| D. 2-node × 8-GPU LoRA SFT demo | 🟡 Script ready, not yet executed | `scripts/run_sft_qwen35_122b_2node_lora.sh` |
+| D. 2-node × 8-GPU LoRA SFT demo | 🟢 In progress (2026-04-24): both nodes torchrun launched with `MASTER_PORT=23456`, awaiting first `iter 1 loss=...` line (~6-15 min after launch). | `scripts/run_sft_qwen35_122b_2node_lora.sh` via `start.sh` |
 | E. 4-node × 8-GPU full SFT | 🟡 Script ready, not yet executed | `scripts/run_sft_qwen35_122b_4node.sh` |
 | F. Real internal multimodal data | ⏳ Pending — user has demo text JSONL only, no real images yet | needs spec |
 
