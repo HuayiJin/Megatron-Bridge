@@ -284,4 +284,61 @@ Dockerfile 默认 `MBRIDGE_DISABLE_CUDNN=0`(其他两个 Python 默认就是 0)�
 
 ---
 
-_最后更新: 2026-04-23 (build mode 启动时初始化)_
+## 11. 角色分离: build host vs runtime host (2026-04-24)
+
+### 概念
+- **build host**(专用开发机): `docker build` 出镜像,**不需要 GPU**
+- **runtime host**(训练节点): `docker run --gpus all`,需要 GPU + driver + nvidia-container-toolkit
+
+### Build host 硬性要求
+| 项 | 要求 | 备注 |
+|---|---|---|
+| OS | Linux x86_64 | NGC 镜像不支持 ARM |
+| Docker | ≥ 20.10,推荐 24+ | 需要 BuildKit |
+| 磁盘 (Docker root) | ≥ 80GB | 镜像 ~35GB + 中间层 |
+| 磁盘 (build context) | ≥ 5GB | source tree + submodule ~200MB |
+| RAM | ≥ 16GB,推荐 32GB | nvcc 编译 mamba-ssm 较吃内存 |
+| 网络 | nvcr.io / pypi.org / pypi.nvidia.com / github.com / astral.sh | 全部能访问 |
+| nvcr.io 凭据 | `docker login nvcr.io` | 免费 NGC API key |
+| 源码 | `git clone NVIDIA-NeMo/Megatron-Bridge && git submodule update --init --recursive` | submodule 必须 init |
+
+### Build host **不需要**
+- ❌ NVIDIA driver / nvidia-container-toolkit (build 不调 GPU)
+- ❌ CUDA toolkit / nvcc (NGC 镜像内自带 12.9)
+- ❌ Python / pip / conda / uv (全在镜像内)
+
+### 工具与文档
+- `scripts/check_build_host.sh` 一键预检 build host(15 项检查,FAIL/WARN 分级)
+- `docs/build_host_setup.md` 完整 build host 准备指南(含一键安装、网络白名单、镜像分发、训练机要求)
+- `USER_TODO.md` 已重排为 P0a (build host 准备) → P0b (build) → P0c (分发) → P1 (容器内验证) → P2 (多节点 SFT)
+
+### 镜像分发(build host → runtime hosts)
+三种方式(详见 `docs/build_host_setup.md` §8):
+1. 私有 registry: `docker tag` + `docker push` + `docker pull`(生产标配)
+2. `docker save` + scp/rsync(简单,无 registry)
+3. 共享 NAS 上 `docker save` 一份(所有节点 `docker load`)
+
+镜像约 35GB,gzip 后约 12-15GB。
+
+---
+
+## 12. Dockerfile submodule 检测 fix (2026-04-24)
+
+### 症状
+首次 `docker build` 在 `STEP 14: git submodule update` 失败:
+```
+fatal: not a git repository (or any of the parent directories): .git
+```
+
+### 根因
+- 我之前的检测条件 `[ ! -f 3rdparty/Megatron-LM/megatron/__init__.py ]` 永远为真,因为 Megatron-LM 的 `megatron/` 是 PEP 420 namespace package,**没有顶层 __init__.py**(只有子包有)
+- 进入分支后尝试 `git submodule update`,但 `docker build` 默认不把 `.git/` 拷进 image,导致 "not a git repository"
+
+### Fix
+- 检测条件改为 `[ ! -f 3rdparty/Megatron-LM/megatron/core/__init__.py ]`(`core/` 是 init 后必存在的子包)
+- 不再尝试在镜像内 git submodule init,改为 fail-fast 提示用户在 host 上 init
+- 已加 `scripts/check_build_host.sh` 预检 submodule 状态
+
+---
+
+_最后更新: 2026-04-24 (build host 角色 + submodule fix + 一键预检脚本)_

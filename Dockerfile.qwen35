@@ -92,12 +92,29 @@ RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
 WORKDIR ${IMAGE_SRC_DIR}
 COPY . ${IMAGE_SRC_DIR}
 
-# Initialise the Megatron-Core submodule. If the build context has it
-# populated already, this is a no-op; otherwise fetched from upstream.
+# Verify the Megatron-Core submodule is populated. We require it to be init'd
+# on the host BEFORE `docker build`, because:
+#   - Docker COPY does not include .git/ by default, so `git submodule update`
+#     inside the image would fail with "not a git repository".
+#   - Even with .git present, the submodule URL points to GitHub which may not
+#     be reachable from inside the image build network.
+#
+# `megatron/core/__init__.py` is the canonical existence check (the top-level
+# `megatron/` is a PEP 420 namespace package with no __init__.py).
 RUN cd ${IMAGE_SRC_DIR} && \
-    if [ ! -f 3rdparty/Megatron-LM/megatron/__init__.py ]; then \
-        git submodule update --init --recursive ; \
-    fi
+    if [ ! -f 3rdparty/Megatron-LM/megatron/core/__init__.py ]; then \
+        echo "" ; \
+        echo "ERROR: 3rdparty/Megatron-LM/megatron/core/__init__.py is missing." ; \
+        echo "       The Megatron-Core submodule was NOT populated when the build" ; \
+        echo "       context was sent to docker. On the host, run:" ; \
+        echo "" ; \
+        echo "         cd $(pwd | sed 's|/opt/Megatron-Bridge|/data/temp/Megatron-Bridge|')" ; \
+        echo "         git submodule update --init --recursive" ; \
+        echo "" ; \
+        echo "       and then re-run docker build." ; \
+        exit 1 ; \
+    fi && \
+    echo "submodule OK: $(ls 3rdparty/Megatron-LM/megatron | tr '\n' ' ')"
 
 # ------------------------------------------------------------------------------
 # Create venv inheriting NGC's whole site-packages (torch / TE / cuDNN /

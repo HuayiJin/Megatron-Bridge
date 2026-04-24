@@ -2,6 +2,10 @@
 
 > 本文件列出 Codewiz 无法在当前会话内完成、需要你(用户)动手的事项。
 > 完成一项后请在前面打 `[x]`,把结果(命令输出)贴回 chat 即可。
+>
+> 角色区分(在不同机器上做不同事):
+> - **build host**(专用开发机, 无 GPU): docker build → 镜像
+> - **runtime host**(训练节点, 8+ H20): docker run → 转换 / smoke / SFT
 
 ---
 
@@ -15,13 +19,92 @@
 
 ---
 
-## 🔴 P0 — 镜像构建(单台 build,~10-15 min)
+## 🔴 P0a — 专用开发机(build host)环境准备
 
-### Task 3: 构建项目镜像
+### Task 3a: 在专用开发机上 clone 仓库 + init submodule
+
+```bash
+cd /data/temp  # 或任意 5+ GB 空闲分区
+git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+cd Megatron-Bridge
+git submodule update --init --recursive
+```
+
+(若你已经在 build host 上有这份仓库,跳过本步)
+
+- [ ] 完成
+
+---
+
+### Task 3b: 把项目脚本/Dockerfile 同步到 build host
+
+把当前 `/data/temp/Megatron-Bridge/` 里我们新增/修改的文件同步到 build host 上的对应位置:
+
+```text
+Dockerfile.qwen35
+.dockerignore
+docker/entrypoint-mbridge.sh
+scripts/check_build_host.sh
+scripts/convert_qwen35_122b.py
+scripts/run_convert_qwen35_122b.sh
+scripts/smoke_qwen35_122b.py
+scripts/run_smoke_qwen35_122b.sh
+scripts/sft_qwen35_122b.py
+scripts/run_sft_qwen35_122b.sh
+scripts/verify_mcore_ckpt.py
+scripts/watch_convert.sh
+docs/qwen35_vl_122b_reproduce.md
+docs/build_host_setup.md
+memory.md
+USER_TODO.md
+```
+
+简单做法 `rsync`:
+
+```bash
+rsync -avz --exclude=.venv --exclude=.git/objects/pack \
+  /data/temp/Megatron-Bridge/ user@build-host:/data/temp/Megatron-Bridge/
+```
+
+或者 build host 也是同一台机器,跳过本步。
+
+- [ ] 完成
+
+---
+
+### Task 3c: 在 build host 上跑预检脚本
 
 ```bash
 cd /data/temp/Megatron-Bridge
-docker build -f Dockerfile.qwen35 -t qwen35-mbridge:cu129 .
+bash scripts/check_build_host.sh
+```
+
+期望末尾输出:
+```
+=== Summary ===
+  passes: 18+, warnings: 0-1, failures: 0
+[READY] Build host is ready.
+```
+
+详细环境要求见 `docs/build_host_setup.md`(包括如何装 Docker、配 NGC 登录、网络白名单等)。
+
+如果 `[NOT READY]`,按提示修复 `[FAIL]` 项再重跑。常见问题:
+- docker 未装 → `curl -fsSL https://get.docker.com | sh && sudo usermod -aG docker $USER`
+- nvcr.io 不通 → 配 HTTPS_PROXY 或在能联网的机器上预 pull 后 `docker save` 传过来
+- 没 NGC 登录 → `docker login nvcr.io`(用户名 `$oauthtoken`,密码是 NGC API key)
+- submodule 没 init → `git submodule update --init --recursive`
+
+- [ ] 预检通过
+
+---
+
+## 🔴 P0b — 镜像构建(build host,~10-22 min)
+
+### Task 4: 构建项目镜像
+
+```bash
+cd /data/temp/Megatron-Bridge
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.qwen35 -t qwen35-mbridge:cu129 .
 ```
 
 预计耗时:
@@ -37,7 +120,7 @@ docker build -f Dockerfile.qwen35 -t qwen35-mbridge:cu129 .
 
 ---
 
-### Task 4: 镜像内开箱验证(5 sec)
+### Task 5: 镜像内开箱验证(在 build host 上,需要有 GPU 才能跑;无 GPU 跳到 Task 6 在训练机验证)
 
 ```bash
 docker run --rm --gpus all qwen35-mbridge:cu129 \
@@ -59,13 +142,35 @@ print('IMAGE OK',
 IMAGE OK torch 2.8.0a0+5228986c39.nv25.06 TE 2.4.0+3cd6870 cuda_avail True
 ```
 
+无 GPU 时只验证 import:把上面 `--gpus all` 去掉,且最后一行 `cuda_avail` 会是 `False`(正常)。
+
 - [ ] 完成
 
 ---
 
-## 🟡 P1 — 容器内端到端跑通
+## 🔴 P0c — 镜像分发到训练机
 
-### Task 5: 进容器,验证转换 + smoke 推理
+### Task 6: docker save → 训练机 docker load
+
+详见 `docs/build_host_setup.md` §8(共三种方式: 私有 registry / docker save+scp / 共享 NAS)。
+
+最常用的方式:
+```bash
+# 在 build host
+docker save qwen35-mbridge:cu129 | gzip > /shared_nas/qwen35-mbridge-cu129.tar.gz
+
+# 在每个训练节点
+gunzip -c /shared_nas/qwen35-mbridge-cu129.tar.gz | docker load
+docker images qwen35-mbridge:cu129  # 验证有了
+```
+
+- [ ] 完成
+
+---
+
+## 🟡 P1 — 容器内端到端跑通(在训练机上)
+
+### Task 7: 进容器,验证转换 + smoke 推理
 
 ```bash
 docker run --rm -it --gpus all --shm-size=64g --ulimit memlock=-1 \
@@ -99,7 +204,7 @@ bash scripts/run_smoke_qwen35_122b.sh
 
 ## 🟢 P2 — 多节点 SFT 真训
 
-### Task 6: 准备多节点
+### Task 8: 准备多节点
 
 | 项 | 说明 |
 |---|---|
@@ -112,7 +217,7 @@ bash scripts/run_smoke_qwen35_122b.sh
 
 ---
 
-### Task 7: 准备 SFT 数据
+### Task 9: 准备 SFT 数据
 
 选一种(详见 `docs/qwen35_vl_122b_reproduce.md` §5.3):
 
@@ -122,7 +227,7 @@ bash scripts/run_smoke_qwen35_122b.sh
 
 ---
 
-### Task 8: 启动多节点 SFT
+### Task 10: 启动多节点 SFT
 
 每个节点上(`$RANK` 由你的调度器/手动赋值 0..N-1):
 
