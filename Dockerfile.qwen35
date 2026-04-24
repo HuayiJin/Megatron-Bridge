@@ -196,10 +196,13 @@ RUN cd ${IMAGE_SRC_DIR} && \
 # Install megatron-bridge as editable.
 # At runtime, the entrypoint will re-`uv pip install -e` against the mount
 # (if the user mounted /workspace/Megatron-Bridge), so live edits work.
+#
+# Note: `uv pip install` ignores UV_PROJECT_ENVIRONMENT (that's a `uv sync`-only
+# variable). We pass --python explicitly to install into the venv.
 # ------------------------------------------------------------------------------
 RUN cd ${IMAGE_SRC_DIR} && \
-    UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} \
-    uv pip install --no-deps -e .
+    uv pip install --link-mode copy --python ${UV_PROJECT_ENVIRONMENT}/bin/python \
+        --no-deps -e .
 
 # ------------------------------------------------------------------------------
 # Install fla (flash-linear-attention) — GDN runtime kernel library.
