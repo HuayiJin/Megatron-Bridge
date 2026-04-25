@@ -88,10 +88,12 @@ The image is a **pure environment image**. It contains only:
 - uv package manager
 - `/opt/venv-mbridge`: venv inheriting all NGC site-packages, plus
   causal-conv1d 1.6.1 + mamba-ssm 2.3.1 (prebuilt wheels, ABI-patched)
-  and flash-linear-attention 0.4.2
+  and flash-linear-attention 0.4.2 + fla-core 0.4.2 (pure Python, network install at build time)
 
 **What the image does NOT contain:** Megatron-Bridge source, megatron-core,
 any editable install. All business code lives on NAS under `/mnt`.
+
+**fla归属：** `flash-linear-attention` + `fla-core` 在 **build time** 通过网络 `pip install` 装入镜像（纯 Python，无 CUDA 编译）。`uv sync` 在运行时**跳过**它们（`--no-install-package flash-linear-attention --no-install-package fla-core`）。
 
 **Why:** eliminates stale-code problems — code changes on `/mnt` are
 immediately effective without rebuilding the image. Image rebuild is only

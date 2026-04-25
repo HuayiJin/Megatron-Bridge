@@ -10,11 +10,11 @@
 #   3. Run `uv sync` to install megatron-core (editable, from submodule) and
 #      all other Python deps declared in pyproject.toml, skipping packages
 #      already provided by the NGC base image (torch, TE, flash-attn, etc.)
-#      and packages already baked into the image (mamba-ssm, causal-conv1d).
+#      and packages already baked into the image (mamba-ssm, causal-conv1d,
+#      flash-linear-attention, fla-core).
 #   4. Run `uv pip install -e .` to install megatron-bridge itself (editable,
 #      pointing at the /mnt source tree so live edits are picked up).
-#   5. Verify that the three baked-in packages (mamba_ssm, causal_conv1d, fla)
-#      import correctly.
+#   5. Verify baked-in packages (mamba_ssm, causal_conv1d, fla) import OK.
 #
 # Idempotent:
 #   Steps 3-4 are fast no-ops if already installed (uv detects no changes).
@@ -110,6 +110,8 @@ UV_PROJECT_ENVIRONMENT="${VENV_DIR}" \
     --no-install-package flash-attn \
     --no-install-package mamba-ssm \
     --no-install-package causal-conv1d \
+    --no-install-package flash-linear-attention \
+    --no-install-package fla-core \
     --no-install-package nvidia-cublas \
     --no-install-package nvidia-cublas-cu12 \
     --no-install-package nvidia-cublas-cu13 \
@@ -176,7 +178,9 @@ if [[ "${MBRIDGE_FILE}" != "${REPO_ROOT}"* ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Verify baked-in packages (mamba_ssm, causal_conv1d, fla)
+# 5. Verify packages baked into the image (mamba_ssm, causal_conv1d, fla).
+#    fla is installed at image build time via `pip install flash-linear-attention`
+#    (which pulls fla-core); it is NOT installed by uv sync above.
 # ---------------------------------------------------------------------------
 echo "[install_runtime_deps] verifying baked-in packages..."
 "${VENV_PY}" - <<'PYEOF'

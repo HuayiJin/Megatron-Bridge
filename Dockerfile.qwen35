@@ -9,9 +9,9 @@
 # What this image contains:
 #   - OS tools (git, tmux, curl, …)
 #   - uv (package manager)
-#   - /opt/venv-mbridge: a venv that inherits NGC site-packages, plus
+#   - /opt/venv-mbridge: a venv that inherits NGC site-packages, plus:
 #       causal-conv1d 1.6.1 + mamba-ssm 2.3.1 (prebuilt wheels, ABI-patched)
-#       flash-linear-attention 0.4.2 (pure Python)
+#       flash-linear-attention 0.4.2 + fla-core 0.4.2 (pure Python, network install)
 #   - mamba_ssm/__init__.py ABI patch (makes import non-fatal on NGC torch 2.8a)
 #
 # What this image does NOT contain:
@@ -20,12 +20,10 @@
 #   - megatron-bridge editable install  ← done at runtime via `uv pip install -e`
 #
 # Design principle:
-#   The image is a pure *environment* image. All business logic (megatron-bridge,
-#   megatron-core, recipes, scripts) lives under /mnt on the NAS and is executed
-#   directly from there at training time. This means:
-#     - No source code baked in → no stale-code problems
-#     - No submodule init required at build time
-#     - Image rebuild is only needed when system packages or wheels change
+#   Pure *environment* image. All business logic lives on the NAS under /mnt.
+#   Operator runs `bash scripts/install_runtime_deps.sh` once per container
+#   to install megatron-core + megatron-bridge, then starts training.
+#   Image rebuild is only needed when system packages or wheels change.
 #
 # Build:
 #   # 1) Download prebuilt wheels (~780 MB) into docker/runtime_wheels/
@@ -36,7 +34,7 @@
 #     'https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
 #   cd ../..
 #
-#   # 2) Build
+#   # 2) Build (build host needs internet access for fla install)
 #   docker build -f Dockerfile.qwen35 -t qwen35-mbridge:cu129 .
 #
 # Run (each node):
@@ -93,7 +91,8 @@ RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
 
 # ------------------------------------------------------------------------------
 # Create venv inheriting NGC's whole site-packages.
-# Verify key NGC packages are present.
+# Verify key NGC packages are present (Python import OK on build host — these
+# are pure-Python metadata checks, no CUDA driver needed).
 # ------------------------------------------------------------------------------
 RUN uv venv ${VENV_DIR} --python /usr/bin/python3.12 \
         --system-site-packages --seed && \
@@ -107,14 +106,30 @@ RUN uv venv ${VENV_DIR} --python /usr/bin/python3.12 \
 #
 # NGC nv25.06 torch ABI is between stock 2.9 and 2.10, so no upstream
 # mamba_ssm wheel loads cleanly (see memory.md §Mamba-SSM ABI Workaround).
-# We use the cu12torch2.8 wheel and patch mamba_ssm/__init__.py to make
+# We use the cu12torch2.8 wheel and patch mamba_ssm/__init__.py below to make
 # the failing selective_scan_cuda import non-fatal.
 # The Qwen3.5-VL GDN path (mamba_ssm.ops.triton.ssd_combined) is pure
 # Python + Triton + causal_conv1d and is unaffected.
+#
+# Wheel download (on build host before `docker build`):
+#   mkdir -p docker/runtime_wheels && cd docker/runtime_wheels
+#   curl -fL -o causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+#     'https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
+#   curl -fL -o mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+#     'https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
 # ------------------------------------------------------------------------------
 ARG WHEELS_DIR=docker/runtime_wheels
 ARG CAUSAL_WHEEL=causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 ARG MAMBA_WHEEL=mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+
+# Fail-fast if wheels are missing on the build host.
+RUN test -d ${WHEELS_DIR} && \
+    test -f ${WHEELS_DIR}/${CAUSAL_WHEEL} && \
+    test -f ${WHEELS_DIR}/${MAMBA_WHEEL} || ( \
+        echo "ERROR: prebuilt wheels missing under ${WHEELS_DIR}/"; \
+        echo "       Download them first — see Build instructions at top of this file."; \
+        exit 1; \
+    )
 
 COPY ${WHEELS_DIR}/${CAUSAL_WHEEL} /tmp/wheels/${CAUSAL_WHEEL}
 COPY ${WHEELS_DIR}/${MAMBA_WHEEL}  /tmp/wheels/${MAMBA_WHEEL}
@@ -122,9 +137,14 @@ COPY ${WHEELS_DIR}/${MAMBA_WHEEL}  /tmp/wheels/${MAMBA_WHEEL}
 RUN ${VENV_DIR}/bin/pip install --no-cache-dir --no-deps \
         /tmp/wheels/${CAUSAL_WHEEL} \
         /tmp/wheels/${MAMBA_WHEEL} && \
-    ${VENV_DIR}/bin/pip install --no-cache-dir --no-deps \
-        flash-linear-attention==${FLA_VERSION} && \
     rm -rf /tmp/wheels
+
+# Install flash-linear-attention (pure Python; fla-core ships the actual fla/ package).
+# --no-deps: avoid pulling Triton/torch from PyPI (already in NGC image).
+RUN ${VENV_DIR}/bin/pip install --no-cache-dir --no-deps \
+        flash-linear-attention==${FLA_VERSION} && \
+    ${VENV_DIR}/bin/pip install --no-cache-dir --no-deps \
+        fla-core==${FLA_VERSION}
 
 # ------------------------------------------------------------------------------
 # Patch mamba_ssm/__init__.py — make selective_scan_cuda import non-fatal.
@@ -147,7 +167,8 @@ __version__ = "2.3.1"
 # Catch BaseException, not just ImportError. The import chain reaches
 # mamba_ssm.ops.triton.layer_norm whose module-level `@triton.autotune(...)`
 # calls `driver.active.get_benchmarker()` which raises RuntimeError (not
-# ImportError) on a no-GPU host.
+# ImportError) on a no-GPU host. We need `import mamba_ssm` to be importable
+# even on the build host (for find_spec / build sanity).
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn  # noqa: F401
 except BaseException as _e:
