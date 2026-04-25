@@ -4,20 +4,23 @@
 # Qwen3.5-122B-A10B FULL SFT — 4 nodes × 8 GPU (= 32 × H800 80G).
 #
 # Recipe: qwen35_vl_122b_a10b_sft_config
-#   default TP=2, PP=6, EP=8, LR=2e-5, GBS=36, seq=4096
+#   default TP=2, PP=6, EP=8, LR=2e-5, GBS=36, seq=2048
 #
 # IMPORTANT — parallelism on 32 GPU:
-#   TP=2 × PP=6 × EP=8 with DP=1 needs 96 GPU (2*6*8). On 32 GPU this is
-#   infeasible. We override to TP=2, PP=4, EP=8, leaving DP=2 (and EP shares
-#   the DP×TP plane, so this still works for MoE).
+#   TP=2 × PP=6 × EP=8 (recipe default) needs 96 GPU. On 32 GPU override:
+#     TP=2, PP=4, EP=4, DP=4.
+#   Math: world_size=32, DP=32/(TP×PP)=32/(2×4)=4. EP must ≤ DP → EP=4.
+#   EP=8 > DP=4 is INVALID (Megatron-Core asserts); do not use EP=8 on 32 GPU.
 #
-# Memory note (122B BF16 + Adam):
-#   - Params bf16     ~244 GB
-#   - Grads  bf16     ~244 GB
-#   - Adam (m,v) fp32 ~976 GB
-#   Total state ~1.46 TB. With TP=2 PP=4 EP=8 and full activation recompute,
-#   per-GPU peak is roughly 70-80 GB on H800 80G — tight. Use distributed
-#   optimizer (recipe default) and `--recompute_granularity=full`.
+#   Layer alignment: model has 48 layers in groups of 4.
+#   PP=4 → 12 layers/stage = 3 complete groups. Boundaries are aligned. ✓
+#
+# Memory note (122B BF16 + Adam, TP=2 PP=4 EP=4 DP=4):
+#   - Params bf16     ~244 GB total → ~7.6 GB/GPU (distributed across TP×PP×EP)
+#   - Grads  bf16     same as params
+#   - Adam (m,v) fp32, ZeRO-1 → sharded across DP=4 → ~30 GB/GPU
+#   Per-GPU peak ≈ 70-78 GB on 80G GPUs — very tight.
+#   Mitigations active: full activation recompute + expandable_segments allocator.
 #
 # Container assumptions: same as run_sft_qwen35_122b_2node_lora.sh (NGC 25.06).
 #
@@ -30,7 +33,7 @@
 #   bash scripts/run_sft_qwen35_122b_4node.sh
 #
 # Override knobs:
-#   TP=2 PP=4 EP=8 ITERS=20 SEQ=4096 GBS=32 MBS=1 ...
+#   TP=2 PP=4 EP=8 ITERS=20 SEQ=2048 GBS=32 MBS=1 ...
 
 set -euo pipefail
 
@@ -68,7 +71,7 @@ EP="${EP:-4}"
 # ---------------------------------------------------------------------------
 RECIPE="${RECIPE:-qwen35_vl_122b_a10b_sft_config}"
 ITERS="${ITERS:-20}"
-SEQ="${SEQ:-4096}"
+SEQ="${SEQ:-2048}"
 GBS="${GBS:-32}"
 MBS="${MBS:-1}"
 LOG_INTERVAL="${LOG_INTERVAL:-1}"
