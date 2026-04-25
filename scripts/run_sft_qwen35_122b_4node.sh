@@ -59,7 +59,9 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 # ---------------------------------------------------------------------------
 TP="${TP:-2}"
 PP="${PP:-4}"
-EP="${EP:-8}"
+# EP must divide DP evenly. DP = world_size/(TP*PP) = 32/(2*4) = 4.
+# EP=8 > DP=4 is invalid (Megatron-Core asserts). Use EP=4.
+EP="${EP:-4}"
 
 # ---------------------------------------------------------------------------
 # Training hyperparameters
@@ -92,20 +94,21 @@ if [[ ! -x "$VENV_PY" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Auto-install runtime-deferred deps (rank-0 only)
+# Install runtime deps + wire megatron.bridge → /mnt (ALL nodes, not just rank 0).
+# install_runtime_deps.sh is idempotent: uv sync is a fast no-op if already done.
+# Running on every node is required so that megatron.bridge resolves to /mnt,
+# not /opt (Pitfall #15). Skipping on non-rank-0 nodes caused the /opt regression.
 # ---------------------------------------------------------------------------
-if [[ "$NODE_RANK" -eq 0 ]]; then
-    if ! "$VENV_PY" -c 'import mamba_ssm, causal_conv1d, fla' >/dev/null 2>&1; then
-        echo "[run_sft] installing runtime-deferred deps (mamba-ssm/causal-conv1d/fla)..."
-        bash "$REPO_ROOT/scripts/install_runtime_deps.sh"
-    fi
-fi
+echo "[run_sft] node ${NODE_RANK}: running install_runtime_deps.sh..."
+bash "$REPO_ROOT/scripts/install_runtime_deps.sh"
 
 # ---------------------------------------------------------------------------
 # Env (NGC container — patches off)
 # ---------------------------------------------------------------------------
 export MBRIDGE_PATCH_NVIDIA_FILE="${MBRIDGE_PATCH_NVIDIA_FILE:-0}"
 export MBRIDGE_DISABLE_CUDNN="${MBRIDGE_DISABLE_CUDNN:-0}"
+# Reduce allocator fragmentation (helps with optimizer-state OOM on 80G GPUs)
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export MBRIDGE_PATCH_GRAD_FUSION="${MBRIDGE_PATCH_GRAD_FUSION:-0}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export PYTHONUNBUFFERED=1
