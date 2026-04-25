@@ -1,0 +1,426 @@
+# syntax=docker/dockerfile:1.7
+# ==============================================================================
+# Dockerfile for Qwen3.5-122B-A10B SFT via megatron-bridge
+# ------------------------------------------------------------------------------
+# Base: NGC PyTorch 25.06-py3
+#   CUDA 12.9.1 / PyTorch 2.8.0a0+nv25.06 / cuDNN 9.10.2 / TE 2.4 / NCCL /
+#   APEX (with cuda ext) / flash-attn 2.7.4 — ALL inherited verbatim.
+#
+# We ONLY install what NGC does not ship:
+#   - uv (package manager)
+#   - megatron-core (3rdparty/Megatron-LM submodule, editable)
+#   - megatron-bridge (this repo, editable)
+#   - causal-conv1d 1.6.1 + mamba-ssm 2.3.1 (prebuilt wheels, see workaround
+#     section below) + flash-linear-attention (`fla`, pure Python)
+#   - small Python deps tail from pyproject.toml
+#
+# Why NOT pin TE/torch/flash-attn/APEX:
+#   NGC ships matched, GPU-tested, performance-tuned versions. Replacing them
+#   either (a) downgrades performance, or (b) breaks ABI between TE-torch.
+#
+# Build (run on the build host):
+#   # 1) Get the source + submodule
+#   git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+#   cd Megatron-Bridge
+#   git submodule update --init --recursive
+#
+#   # 2) Download the two prebuilt wheels mamba-ssm/causal-conv1d (~780 MB)
+#   mkdir -p docker/runtime_wheels && cd docker/runtime_wheels
+#   curl -fL -o causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+#     'https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
+#   curl -fL -o mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+#     'https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
+#   cd ../..
+#
+#   # 3) Build
+#   docker build -f Dockerfile.qwen35 -t qwen35-mbridge:cu129 .
+#
+# Run (mount source + HF weights + workspace):
+#   docker run --rm -it --gpus all --shm-size=64g --ulimit memlock=-1 \
+#     --network host \
+#     -v "$PWD":/workspace/Megatron-Bridge \
+#     -v /path/to/hf/weights:/models:ro \
+#     -v /path/to/runs:/workspace/runs \
+#     qwen35-mbridge:cu129 bash
+# ==============================================================================
+
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.06-py3
+FROM ${BASE_IMAGE}
+
+# ------------------------------------------------------------------------------
+# Build-time configuration (override via --build-arg if needed)
+# ------------------------------------------------------------------------------
+ARG UV_VERSION=0.9.18
+# Path inside image where the source is COPIED for fallback
+ARG IMAGE_SRC_DIR=/opt/Megatron-Bridge
+# Path the user is expected to mount source into; entrypoint prefers this
+ARG MOUNT_SRC_DIR=/workspace/Megatron-Bridge
+# venv path (independent from any /opt/venv that NGC may ship)
+ARG VENV_DIR=/opt/venv-mbridge
+
+# Pinned versions for the runtime-deferred packages (NGC does not ship them;
+# entrypoint installs them on first launch via scripts/install_runtime_deps.sh).
+# Override at `docker run -e MAMBA_SSM_VERSION=2.4.0` to upgrade without rebuild.
+ARG MAMBA_SSM_VERSION=2.3.1
+ARG CAUSAL_CONV1D_VERSION=1.6.1
+ARG FLA_VERSION=0.4.2
+
+# ------------------------------------------------------------------------------
+# Runtime environment
+# ------------------------------------------------------------------------------
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=${VENV_DIR} \
+    HF_HOME=/workspace/hf_cache \
+    CUDA_DEVICE_MAX_CONNECTIONS=1 \
+    NCCL_NVLS_ENABLE=0 \
+    TORCH_NCCL_AVOID_RECORD_STREAMS=1 \
+    MBRIDGE_IMAGE_SRC_DIR=${IMAGE_SRC_DIR} \
+    MBRIDGE_MOUNT_SRC_DIR=${MOUNT_SRC_DIR} \
+    MBRIDGE_VENV_DIR=${VENV_DIR} \
+    # NGC ships a healthy cuDNN 9; opt out of the bare-metal "disable cuDNN"
+    # workaround. Override at `docker run -e MBRIDGE_DISABLE_CUDNN=1` if needed.
+    MBRIDGE_DISABLE_CUDNN=0 \
+    # Runtime-deferred dep versions (read by scripts/install_runtime_deps.sh)
+    MAMBA_SSM_VERSION=${MAMBA_SSM_VERSION} \
+    CAUSAL_CONV1D_VERSION=${CAUSAL_CONV1D_VERSION} \
+    FLA_VERSION=${FLA_VERSION}
+
+# ------------------------------------------------------------------------------
+# OS deps that NGC may not ship explicitly
+# ------------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git git-lfs ninja-build cmake curl ca-certificates jq tmux less \
+    && rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------------------------
+# uv (Astral) — package manager. NGC 25.06 doesn't ship it.
+# ------------------------------------------------------------------------------
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv --version
+
+# ------------------------------------------------------------------------------
+# Copy megatron-bridge source as fallback (mount can override at runtime).
+# .dockerignore controls what NOT to send.
+# ------------------------------------------------------------------------------
+WORKDIR ${IMAGE_SRC_DIR}
+COPY . ${IMAGE_SRC_DIR}
+
+# Verify the Megatron-Core submodule is populated. We require it to be init'd
+# on the host BEFORE `docker build`, because:
+#   - Docker COPY does not include .git/ by default, so `git submodule update`
+#     inside the image would fail with "not a git repository".
+#   - Even with .git present, the submodule URL points to GitHub which may not
+#     be reachable from inside the image build network.
+#
+# `megatron/core/__init__.py` is the canonical existence check (the top-level
+# `megatron/` is a PEP 420 namespace package with no __init__.py).
+RUN cd ${IMAGE_SRC_DIR} && \
+    if [ ! -f 3rdparty/Megatron-LM/megatron/core/__init__.py ]; then \
+        echo "" ; \
+        echo "ERROR: 3rdparty/Megatron-LM/megatron/core/__init__.py is missing." ; \
+        echo "       The Megatron-Core submodule was NOT populated when the build" ; \
+        echo "       context was sent to docker. On the host, run:" ; \
+        echo "" ; \
+        echo "         cd $(pwd | sed 's|/opt/Megatron-Bridge|/data/temp/Megatron-Bridge|')" ; \
+        echo "         git submodule update --init --recursive" ; \
+        echo "" ; \
+        echo "       and then re-run docker build." ; \
+        exit 1 ; \
+    fi && \
+    echo "submodule OK: $(ls 3rdparty/Megatron-LM/megatron | tr '\n' ' ')"
+
+# ------------------------------------------------------------------------------
+# Create venv inheriting NGC's whole site-packages (torch / TE / cuDNN /
+# flash-attn / APEX / NCCL / cuBLAS / cuFFT / etc.).
+# --system-site-packages: any module already system-installed is visible.
+# --seed: include pip in the venv for ad-hoc installs.
+# ------------------------------------------------------------------------------
+RUN cd ${IMAGE_SRC_DIR} && \
+    uv venv ${UV_PROJECT_ENVIRONMENT} --python /usr/bin/python3.12 \
+        --system-site-packages --seed && \
+    ${UV_PROJECT_ENVIRONMENT}/bin/python -c "import torch; print('inherited torch:', torch.__version__, 'cuda:', torch.version.cuda)" && \
+    ${UV_PROJECT_ENVIRONMENT}/bin/python -c "import transformer_engine; print('inherited TE:', transformer_engine.__version__)" && \
+    ${UV_PROJECT_ENVIRONMENT}/bin/python -c "import flash_attn; print('inherited flash-attn:', flash_attn.__version__)" && \
+    ${UV_PROJECT_ENVIRONMENT}/bin/python -c "import fused_weight_gradient_mlp_cuda; print('inherited APEX cuda ext: OK')"
+
+# ------------------------------------------------------------------------------
+# uv sync: pull megatron-bridge dependencies, but skip everything NGC has.
+# This installs:
+#   - megatron-core (editable, from 3rdparty/Megatron-LM submodule)
+#   - small Python deps: hydra, omegaconf, peft, jsonargparse, energon, ...
+# It does NOT install: torch, TE, flash-attn, mamba-ssm, causal-conv1d,
+# nvidia-cu1[23]-* — those are either NGC-provided or installed manually below.
+# ------------------------------------------------------------------------------
+RUN cd ${IMAGE_SRC_DIR} && \
+    UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} \
+    uv sync --link-mode copy --all-extras --all-groups \
+        --no-install-package torch \
+        --no-install-package torchvision \
+        --no-install-package triton \
+        --no-install-package transformer-engine \
+        --no-install-package transformer-engine-torch \
+        --no-install-package transformer-engine-cu12 \
+        --no-install-package flash-attn \
+        --no-install-package mamba-ssm \
+        --no-install-package causal-conv1d \
+        --no-install-package nvidia-cublas \
+        --no-install-package nvidia-cublas-cu12 \
+        --no-install-package nvidia-cublas-cu13 \
+        --no-install-package nvidia-cuda-cupti \
+        --no-install-package nvidia-cuda-cupti-cu12 \
+        --no-install-package nvidia-cuda-cupti-cu13 \
+        --no-install-package nvidia-cuda-nvrtc \
+        --no-install-package nvidia-cuda-nvrtc-cu12 \
+        --no-install-package nvidia-cuda-nvrtc-cu13 \
+        --no-install-package nvidia-cuda-runtime \
+        --no-install-package nvidia-cuda-runtime-cu12 \
+        --no-install-package nvidia-cuda-runtime-cu13 \
+        --no-install-package nvidia-cudnn-cu12 \
+        --no-install-package nvidia-cudnn-cu13 \
+        --no-install-package nvidia-cufft \
+        --no-install-package nvidia-cufft-cu12 \
+        --no-install-package nvidia-cufft-cu13 \
+        --no-install-package nvidia-cufile \
+        --no-install-package nvidia-curand \
+        --no-install-package nvidia-curand-cu12 \
+        --no-install-package nvidia-curand-cu13 \
+        --no-install-package nvidia-cusolver \
+        --no-install-package nvidia-cusolver-cu12 \
+        --no-install-package nvidia-cusolver-cu13 \
+        --no-install-package nvidia-cusparse \
+        --no-install-package nvidia-cusparse-cu12 \
+        --no-install-package nvidia-cusparse-cu13 \
+        --no-install-package nvidia-cusparselt-cu12 \
+        --no-install-package nvidia-cusparselt-cu13 \
+        --no-install-package nvidia-nccl-cu12 \
+        --no-install-package nvidia-nccl-cu13 \
+        --no-install-package nvidia-nvjitlink \
+        --no-install-package nvidia-nvjitlink-cu12 \
+        --no-install-package nvidia-nvjitlink-cu13 \
+        --no-install-package nvidia-nvshmem-cu12 \
+        --no-install-package nvidia-nvshmem-cu13 \
+        --no-install-package nvidia-nvtx \
+        --no-install-package nvidia-nvtx-cu12 \
+        --no-install-package nvidia-nvtx-cu13 \
+        --no-install-package cuda-toolkit \
+        --no-install-package apex
+
+# ------------------------------------------------------------------------------
+# Install megatron-bridge as editable.
+# At runtime, the entrypoint will re-`uv pip install -e` against the mount
+# (if the user mounted /workspace/Megatron-Bridge), so live edits work.
+#
+# Note: `uv pip install` ignores UV_PROJECT_ENVIRONMENT (that's a `uv sync`-only
+# variable). We pass --python explicitly to install into the venv.
+# ------------------------------------------------------------------------------
+RUN cd ${IMAGE_SRC_DIR} && \
+    uv pip install --link-mode copy --python ${UV_PROJECT_ENVIRONMENT}/bin/python \
+        --no-deps -e .
+
+# ------------------------------------------------------------------------------
+# Bake mamba-ssm / causal-conv1d / fla into the image (revised 2026-04-24).
+#
+# History — why we no longer source-build at runtime:
+#   1) The original plan was to defer `pip install mamba-ssm causal-conv1d fla`
+#      to first container launch, run by scripts/install_runtime_deps.sh.
+#   2) That source build takes 30+ min: mamba-ssm setup.py forces nvcc to
+#      compile 9 SM archs (sm_62..sm_120) serially, ignoring TORCH_CUDA_ARCH_LIST.
+#      ~95% of the compile time targets archs we don't have.
+#   3) We tried the upstream prebuilt wheels (cu12torch{2.8,2.9,2.10}cxx11abiTRUE
+#      cp312). NONE load cleanly on NGC nv25.06's torch 2.8a ABI:
+#         - torch2.8/2.9 wheel:  undefined c10::cuda::SetDevice(int8_t, bool)
+#         - torch2.10  wheel:    undefined c10::cuda::c10_cuda_check_implementation(..., bool)
+#      The NGC patched torch ABI sits between stock 2.9 and 2.10.
+#   4) BUT: only mamba_ssm's `selective_scan_cuda.so` extension trips. The
+#      Triton path used by Qwen3.5-VL GDN
+#      (mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined) is pure
+#      Python + Triton + causal_conv1d, and causal_conv1d's cu12torch2.8 wheel
+#      works fine. So if we make `import mamba_ssm` non-fatal when
+#      selective_scan_cuda fails to load, GDN still runs.
+#
+# What this section does:
+#   a) COPY two prebuilt wheels (~780 MB total) from docker/runtime_wheels/
+#      and pip-install them with --no-deps.
+#   b) pip-install fla (pure Python, no compile).
+#   c) Overwrite mamba_ssm/__init__.py with a try/except-guarded version so
+#      the failing CUDA-ext import becomes a one-line warning. Mamba1 paths
+#      (selective_scan_fn, mamba_inner_fn) are disabled, but Qwen3.5-VL
+#      doesn't use them.
+#
+# Wheel download (run on the build host before `docker build`):
+#   mkdir -p docker/runtime_wheels && cd docker/runtime_wheels
+#   curl -fL -o causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+#     'https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
+#   curl -fL -o mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl \
+#     'https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'
+#
+# See memory.md §"Mamba-SSM ABI Workaround" for full background.
+# ------------------------------------------------------------------------------
+
+ARG WHEELS_DIR=docker/runtime_wheels
+ARG CAUSAL_WHEEL=causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+ARG MAMBA_WHEEL=mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+
+# Fail-fast if the build host forgot to download the wheels.
+RUN test -d ${IMAGE_SRC_DIR}/${WHEELS_DIR} && \
+    test -f ${IMAGE_SRC_DIR}/${WHEELS_DIR}/${CAUSAL_WHEEL} && \
+    test -f ${IMAGE_SRC_DIR}/${WHEELS_DIR}/${MAMBA_WHEEL} || ( \
+        echo "ERROR: prebuilt wheels missing under ${IMAGE_SRC_DIR}/${WHEELS_DIR}"; \
+        echo "       Download them on the build host before docker build:"; \
+        echo "         curl -fL -o ${CAUSAL_WHEEL} \\"; \
+        echo "           'https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/${CAUSAL_WHEEL//+/%2B}'"; \
+        echo "         curl -fL -o ${MAMBA_WHEEL} \\"; \
+        echo "           'https://github.com/state-spaces/mamba/releases/download/v2.3.1/${MAMBA_WHEEL//+/%2B}'"; \
+        exit 1 ; \
+    )
+
+# Install causal_conv1d + mamba_ssm prebuilt wheels (no deps; ABI is matched
+# to NGC nv25.06 torch 2.8a as best we can).
+RUN ${UV_PROJECT_ENVIRONMENT}/bin/pip install --no-cache-dir --no-deps \
+        ${IMAGE_SRC_DIR}/${WHEELS_DIR}/${CAUSAL_WHEEL} \
+        ${IMAGE_SRC_DIR}/${WHEELS_DIR}/${MAMBA_WHEEL} && \
+    ${UV_PROJECT_ENVIRONMENT}/bin/pip install --no-cache-dir --no-deps \
+        flash-linear-attention==${FLA_VERSION}
+
+# Overwrite mamba_ssm/__init__.py to make the (intentionally) failing
+# selective_scan_cuda import non-fatal. This is what unblocks `import mamba_ssm`
+# despite the NGC torch ABI mismatch on selective_scan_cuda.so. The Qwen3.5-VL
+# GDN code path (mamba_ssm.ops.triton.ssd_combined) does NOT depend on it.
+RUN cat > ${UV_PROJECT_ENVIRONMENT}/lib/python3.12/site-packages/mamba_ssm/__init__.py <<'PYEOF'
+__version__ = "2.3.1"
+
+# NGC nv25.06 patched torch 2.8 has an ABI between stock torch 2.9 and 2.10,
+# so neither stock cu12torch2.8/2.9/2.10 prebuilt wheel matches:
+#   - torch2.8/2.9 wheel:  undefined c10::cuda::SetDevice(int8_t, bool)
+#   - torch2.10  wheel:    undefined c10::cuda::c10_cuda_check_implementation(..., bool)
+# The `selective_scan_cuda` extension is only used by the legacy
+# selective_scan_interface / Mamba1 / mamba_inner_fn paths. Megatron-Core's
+# Qwen3.5-VL GDN path uses mamba_ssm.ops.triton.ssd_combined which is pure
+# Python + Triton + causal_conv1d (the latter has a working wheel for our ABI).
+# So we make the legacy CUDA imports best-effort: keep them if they load, but
+# do not break `import mamba_ssm` if they don't.
+#
+# Catch BaseException, not just ImportError. The import chain reaches
+# mamba_ssm.ops.triton.layer_norm whose module-level `@triton.autotune(...)`
+# calls `driver.active.get_benchmarker()` which raises RuntimeError (not
+# ImportError) on a no-GPU host. We need `import mamba_ssm` to be importable
+# even on the build host (for find_spec / build sanity).
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn  # noqa: F401
+except BaseException as _e:
+    selective_scan_fn = None
+    mamba_inner_fn = None
+    import warnings
+    warnings.warn(
+        "mamba_ssm.selective_scan_cuda failed to load "
+        "(NGC torch ABI mismatch, or no-GPU build host); "
+        "selective_scan_fn / mamba_inner_fn / Mamba1 will not work, but the "
+        "Triton-based mamba_ssm.ops.triton.ssd_combined path used by "
+        "megatron-core (Mamba2 / GDN) is unaffected. Original error: " + str(_e)
+    )
+
+try:
+    from mamba_ssm.modules.mamba_simple import Mamba  # noqa: F401
+except BaseException:
+    Mamba = None
+
+try:
+    from mamba_ssm.modules.mamba2 import Mamba2  # noqa: F401
+except BaseException:
+    Mamba2 = None
+
+try:
+    from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # noqa: F401
+except BaseException:
+    MambaLMHeadModel = None
+PYEOF
+
+# ------------------------------------------------------------------------------
+# Build-time sanity (NO-GPU build host) — pure shell file checks, NO Python.
+#
+# HARD CONSTRAINT: this RUN must NOT execute *any* Python that imports
+# mamba_ssm / megatron.bridge / triton autotune. Even importlib.util.find_spec
+# on a sub-module imports the parent __init__.py, which on mamba_ssm chains
+# into mamba_ssm.ops.triton.layer_norm whose `@triton.autotune(...)` triggers
+# `driver.active.get_benchmarker()` and dies with "RuntimeError: 0 active
+# drivers" on a no-GPU build host.
+#
+# So we do everything with `test -f` / `grep`. Real GPU verification happens
+# at container start via scripts/runtime_sanity.sh inside a --gpus all
+# container. See memory.md Pitfall #13.
+# ------------------------------------------------------------------------------
+RUN set -e; \
+    SP=${UV_PROJECT_ENVIRONMENT}/lib/python3.12/site-packages; \
+    echo "============================================================"; \
+    echo "Build-time sanity (file-presence only, no Python imports)"; \
+    echo "============================================================"; \
+    echo "[Bake-in package files]"; \
+    for f in \
+        causal_conv1d/__init__.py \
+        mamba_ssm/__init__.py \
+        mamba_ssm/ops/triton/ssd_combined.py \
+        fla/__init__.py \
+    ; do \
+        if [ -f "$SP/$f" ]; then \
+            echo "  ok    $f"; \
+        else \
+            echo "  FAIL  $f (missing)"; exit 1; \
+        fi; \
+    done; \
+    echo ""; \
+    echo "[Patch marker in mamba_ssm/__init__.py]"; \
+    if grep -q "NGC nv25.06 patched torch" "$SP/mamba_ssm/__init__.py"; then \
+        echo "  ok    NGC ABI fallback patch present"; \
+    else \
+        echo "  FAIL  mamba_ssm/__init__.py NOT patched (runtime will crash on import)"; \
+        exit 1; \
+    fi; \
+    echo ""; \
+    echo "[Editable .pth (megatron-core / megatron-bridge)]"; \
+    for f in \
+        __editable__.megatron_core-*.pth \
+        __editable__.megatron_bridge-*.pth \
+    ; do \
+        if ls $SP/$f >/dev/null 2>&1; then \
+            echo "  ok    $(basename $(ls $SP/$f | head -1))"; \
+        else \
+            echo "  FAIL  no $f under $SP"; exit 1; \
+        fi; \
+    done; \
+    echo ""; \
+    echo "[Distribution metadata (best-effort)]"; \
+    for d in \
+        causal_conv1d \
+        mamba_ssm \
+        flash_linear_attention \
+    ; do \
+        if ls $SP/${d}-*.dist-info >/dev/null 2>&1; then \
+            echo "  ok    ${d} dist-info present"; \
+        else \
+            echo "  warn  ${d} dist-info missing (likely renamed; not fatal)"; \
+        fi; \
+    done; \
+    echo ""; \
+    echo "OK: file-presence sanity passed."; \
+    echo "    For a real GPU smoke test inside a --gpus all container, run:"; \
+    echo "       bash scripts/runtime_sanity.sh"
+
+# ------------------------------------------------------------------------------
+# Entrypoint that handles "mount overrides baked-in source" semantics
+# ------------------------------------------------------------------------------
+COPY docker/entrypoint-mbridge.sh /usr/local/bin/entrypoint-mbridge.sh
+RUN chmod +x /usr/local/bin/entrypoint-mbridge.sh
+
+# Make the venv the default Python environment
+ENV PATH=${VENV_DIR}/bin:${PATH}
+
+# Default working directory; user usually mounts source here
+WORKDIR /workspace/Megatron-Bridge
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-mbridge.sh"]
+CMD ["bash"]

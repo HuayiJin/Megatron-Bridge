@@ -32,7 +32,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 VENV_DIR="${VENV_DIR:-/opt/venv-mbridge}"
 VENV_PY="${VENV_PY:-${VENV_DIR}/bin/python}"
-VENV_UV="${VENV_DIR}/bin/uv"
+VENV_UV="/usr/local/bin/uv"
 
 FORCE=0
 for arg in "$@"; do
@@ -98,6 +98,7 @@ FORCE_FLAG=""
 UV_PROJECT_ENVIRONMENT="${VENV_DIR}" \
 "${VENV_UV}" sync \
     --link-mode copy \
+    --inexact \
     --all-extras \
     --all-groups \
     ${FORCE_FLAG} \
