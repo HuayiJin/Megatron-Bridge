@@ -139,6 +139,12 @@ OVERRIDES=(
     model.recompute_method=uniform
     model.recompute_num_layers=1
 
+    # Disable MTP (Multi-Token Prediction) to relieve last-pipeline-stage memory.
+    # MTP adds ~1 extra transformer block + LM-head overhead only on the last PP stage,
+    # causing rank3 OOM while rank0-2 are fine. MTP is for inference throughput, not
+    # needed for SFT training correctness.
+    model.mtp_num_layers=0
+
     # GDN constraint
     dataset.pack_sequences_in_batch=False
 
