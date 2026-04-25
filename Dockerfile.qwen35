@@ -122,15 +122,6 @@ ARG WHEELS_DIR=docker/runtime_wheels
 ARG CAUSAL_WHEEL=causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 ARG MAMBA_WHEEL=mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 
-# Fail-fast if wheels are missing on the build host.
-RUN test -d ${WHEELS_DIR} && \
-    test -f ${WHEELS_DIR}/${CAUSAL_WHEEL} && \
-    test -f ${WHEELS_DIR}/${MAMBA_WHEEL} || ( \
-        echo "ERROR: prebuilt wheels missing under ${WHEELS_DIR}/"; \
-        echo "       Download them first — see Build instructions at top of this file."; \
-        exit 1; \
-    )
-
 COPY ${WHEELS_DIR}/${CAUSAL_WHEEL} /tmp/wheels/${CAUSAL_WHEEL}
 COPY ${WHEELS_DIR}/${MAMBA_WHEEL}  /tmp/wheels/${MAMBA_WHEEL}
 
