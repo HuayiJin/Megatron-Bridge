@@ -28,6 +28,13 @@
 - Save `/data/temp/...` paths into scripts — that prefix only existed on the
   old bare-metal host; on the cluster use NAS paths under
   `/mnt/tidal-alsh01/dataset/redone/hade/...`
+- Set `moe_router_fusion=True` in NGC 25.06 (TE 2.4) — `transformer_engine.pytorch.router`
+  does not exist until TE ≥ 2.7; enabling it raises `ValueError: fused_topk_with_score_function
+  is not available`. Use `False` (< 0.01 % FLOP overhead). See Pitfall #14.
+- `pip install --upgrade transformer-engine` inside the NGC container — TE is
+  tightly ABI-coupled to NGC's patched torch 2.8a; a PyPI TE wheel will break
+  fused_permute / FP8 / flash-attn interfaces. Upgrade TE only by switching to
+  a new NGC base image that ships TE ≥ 2.7.
 
 **ASK FIRST:**
 - Before changing recipe selection (LoRA vs full SFT vs PEFT scheme)
@@ -156,6 +163,7 @@ left alone.
 | 11 | `MASTER_PORT` differs across nodes in this cluster (master saw `23964`, worker saw `23456`) | Two-node rendezvous silently hangs forever with no error. The cluster's true default is **23456** — always pass `MASTER_PORT=23456` explicitly when launching `start.sh` if you can't trust the per-node injected value. Symptom: torchrun process alive, 65 threads, sleeping; no worker fork; both nodes look "stuck after OMP banner". |
 | 12 | torchrun gives no output for 6–15 min after the OMP banner | NORMAL. Sequence: (a) rendezvous (~10 s), (b) `import megatron.bridge` per rank (60–180 s, fully silent), (c) 234 GB mcore ckpt mmap+load across 16 ranks (3–10 min), (d) iter 1 cold compile+forward+backward (1–3 min). Watch `nvidia-smi` GPU memory rising as a liveness signal; first `iter 1 loss=...` line marks success. |
 | 13 | `import mamba_ssm` (or submodules) crashes inside `docker build` with `RuntimeError: 0 active drivers ([])` | Build host has NO GPU. The chain `import mamba_ssm` → `selective_scan_interface.py` → `mamba_ssm.ops.triton.layer_norm` triggers `@triton.autotune(...)` at module load, which calls `driver.active.get_benchmarker()` and dies. **Important:** even `importlib.util.find_spec("mamba_ssm.ops.triton.ssd_combined")` triggers it, because resolving a submodule requires importing the parent package's `__init__.py`. Catching `BaseException` inside our patched `mamba_ssm/__init__.py` would help for the parent import, but not for `find_spec` of submodules whose own module-level autotune still fires. **Fix in Dockerfile.qwen35 (final form 2026-04-24)**: build-time sanity is **pure shell** (`test -f` / `grep`). NO Python imports of any flavour, NO `find_spec`, NO `importlib.metadata`. Real GPU-side verification still happens at container start via `scripts/runtime_sanity.sh` inside a `--gpus all` container. **Cross-cutting rule (also documented in Dockerfile.qwen35 STEP "Build-time sanity" header):** no `import mamba_ssm*` and no `import megatron.bridge` (same hazard, chains into `emerging_optimizers`) in any `RUN` step. |
+| 14 | `ValueError: fused_topk_with_score_function is not available. Please install TE >= 2.6.0.` on rank 5 (and all ranks) at training start | **Root cause**: `_qwen35_vl_apply_moe()` in `src/megatron/bridge/recipes/qwen_vl/qwen35_vl.py` had `moe_router_fusion = True`. `fused_topk_with_score_function` lives in `transformer_engine.pytorch.router`, which does not exist in TE 2.4 (NGC 25.06); megatron-core sets it to `None` and raises when the fused path is requested. **Analysis**: router topk is < 0.01 % of total MoE FLOPS (256 experts × topk=8 → ~4 K ops vs ~50 M ops expert GEMM per token); the unfused `torch.softmax + torch.topk + scatter` path is negligible. Upgrading TE inside NGC would break the ABI between NGC's patched torch 2.8a and TE's `.so` (same class of problem as `mamba_ssm` selective_scan, see Pitfall #10). **Fix (2026-04-25)**: set `cfg.model.moe_router_fusion = False` in `_qwen35_vl_apply_moe()`. `moe_permute_fusion` and `moe_grouped_gemm` are unaffected and remain `True`. Re-enable `moe_router_fusion` only after switching to an NGC base image that ships TE ≥ 2.7. |
 
 ## Mamba-SSM ABI Workaround (NGC nv25.06)
 
@@ -346,4 +354,4 @@ Older bare-metal venv setup (cu128 + TE 2.7 + flash-attn 2.8.1, single-node
 H20-141G, `/data/temp/...` paths), build-host preparation notes, Dockerfile
 iteration history, conversion debugging — see **`memory_legacy.md`**.
 
-_Last updated: 2026-04-24 (NGC 25.06 + cu12.9 cluster, 2-node LoRA demo + 4-node full SFT scripts ready)_
+_Last updated: 2026-04-25 (Pitfall #14: moe_router_fusion=False for TE 2.4 / NGC 25.06; NEVER boundary for TE upgrade added)_

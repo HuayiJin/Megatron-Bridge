@@ -154,7 +154,13 @@ def _qwen35_vl_apply_moe(cfg: ConfigContainer, *, ep: int, etp: int = 1) -> None
     cfg.model.moe_token_dispatcher_type = "alltoall"
 
     # MoE kernel selections
-    cfg.model.moe_router_fusion = True
+    # moe_router_fusion requires transformer_engine.pytorch.router (TE >= 2.7).
+    # NGC 25.06 ships TE 2.4, which has no pytorch.router module, so
+    # fused_topk_with_score_function is None and the fused path raises ValueError.
+    # The unfused path (torch.softmax + torch.topk + scatter) costs <0.01% of
+    # total MoE FLOPS (router: ~4 K ops vs expert GEMM: ~50 M ops per token).
+    # Re-enable only after upgrading to a NGC image that ships TE >= 2.7.
+    cfg.model.moe_router_fusion = False  # TE 2.4 (NGC 25.06) — no pytorch.router
     cfg.model.moe_permute_fusion = True
     cfg.model.moe_grouped_gemm = True
 
