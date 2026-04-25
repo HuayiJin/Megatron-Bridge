@@ -179,6 +179,24 @@ if [[ "${MBRIDGE_FILE}" != "${REPO_ROOT}"* ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 4b. TE 2.4 compatibility: inject te.pytorch.distributed as a module attribute.
+#
+# megatron/core/extensions/transformer_engine.py (Megatron-LM commit 9978968)
+# references `te.pytorch.distributed.CudaRNGStatesTracker` at class-definition
+# time (module top-level, not inside a function). After `import transformer_engine
+# as te`, the `.pytorch.distributed` submodule is NOT automatically accessible
+# as an attribute chain unless it has been explicitly imported.
+# TE 2.4 has the submodule at transformer_engine.pytorch.distributed but does
+# not auto-expose it. A .pth file in site-packages is executed at Python startup,
+# which causes the submodule to be imported and wired as an attribute before any
+# megatron import runs. This avoids touching 3rdparty/ (NEVER boundary).
+# ---------------------------------------------------------------------------
+SITE_PACKAGES="$("${VENV_PY}" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+TE_COMPAT_PTH="${SITE_PACKAGES}/te_distributed_compat.pth"
+echo "import transformer_engine.pytorch.distributed" > "${TE_COMPAT_PTH}"
+echo "[install_runtime_deps] wrote TE compat pth: ${TE_COMPAT_PTH}"
+
+# ---------------------------------------------------------------------------
 # 5. Verify packages baked into the image (mamba_ssm, causal_conv1d, fla).
 #    fla is installed at image build time via `pip install flash-linear-attention`
 #    (which pulls fla-core); it is NOT installed by uv sync above.
