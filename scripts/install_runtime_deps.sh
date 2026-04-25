@@ -1,98 +1,185 @@
 #!/usr/bin/env bash
-# Install runtime-deferred dependencies (mamba-ssm / causal-conv1d / fla)
-# inside the qwen35-mbridge container.
+# Prepare the megatron-bridge runtime environment inside the qwen35-mbridge container.
 #
-# WHY at runtime instead of in the image:
-#   - mamba-ssm + causal-conv1d need nvcc compile (5-15 min, +400MB)
-#   - mamba-ssm import touches CUDA driver -> fails inside `docker build` (no GPU)
-#   - flash-linear-attention is pure-python but only useful with CUDA
-#   - Allows version overrides without rebuilding the image
+# This script is the SINGLE setup step that must be run once per container
+# launch, from the /mnt source tree, before starting training.
+#
+# What it does:
+#   1. Verify the venv (/opt/venv-mbridge) is present.
+#   2. Initialize 3rdparty/Megatron-LM git submodule if empty.
+#   3. Run `uv sync` to install megatron-core (editable, from submodule) and
+#      all other Python deps declared in pyproject.toml, skipping packages
+#      already provided by the NGC base image (torch, TE, flash-attn, etc.)
+#      and packages already baked into the image (mamba-ssm, causal-conv1d).
+#   4. Run `uv pip install -e .` to install megatron-bridge itself (editable,
+#      pointing at the /mnt source tree so live edits are picked up).
+#   5. Verify that the three baked-in packages (mamba_ssm, causal_conv1d, fla)
+#      import correctly.
 #
 # Idempotent:
-#   - Skips installation if all three packages import OK (fast no-op ~1s)
-#   - Use --force to reinstall anyway
+#   Steps 3-4 are fast no-ops if already installed (uv detects no changes).
+#   Run with --force to reinstall everything unconditionally.
 #
-# Usage:
-#   bash scripts/install_runtime_deps.sh           # install if missing
-#   bash scripts/install_runtime_deps.sh --force   # reinstall
-#   MAMBA_SSM_VERSION=2.4.0 bash scripts/install_runtime_deps.sh   # version pin
+# Usage (run from the repo root on /mnt):
+#   cd /mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge
+#   bash scripts/install_runtime_deps.sh
+#   bash scripts/install_runtime_deps.sh --force   # reinstall unconditionally
 
 set -euo pipefail
 
-VENV_PY="${VENV_PY:-/opt/venv-mbridge/bin/python}"
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 VENV_DIR="${VENV_DIR:-/opt/venv-mbridge}"
-
-MAMBA_SSM_VERSION="${MAMBA_SSM_VERSION:-2.3.1}"
-CAUSAL_CONV1D_VERSION="${CAUSAL_CONV1D_VERSION:-1.6.1}"
-FLA_VERSION="${FLA_VERSION:-0.4.2}"
+VENV_PY="${VENV_PY:-${VENV_DIR}/bin/python}"
+VENV_UV="${VENV_DIR}/bin/uv"
 
 FORCE=0
 for arg in "$@"; do
     case "$arg" in
         --force|-f) FORCE=1 ;;
         --help|-h)
-            sed -n '2,22p' "$0"
+            sed -n '2,30p' "$0"
             exit 0
             ;;
-        *) echo "[install_runtime_deps] unknown arg: $arg" ; exit 2 ;;
+        *) echo "[install_runtime_deps] unknown arg: $arg"; exit 2 ;;
     esac
 done
 
-if [[ ! -x "$VENV_PY" ]]; then
-    echo "[install_runtime_deps] FATAL: venv python not found at $VENV_PY"
+# ---------------------------------------------------------------------------
+# 0. Must run from inside the Megatron-Bridge source tree
+# ---------------------------------------------------------------------------
+if [[ ! -f "pyproject.toml" ]]; then
+    echo "[install_runtime_deps] FATAL: run this script from the Megatron-Bridge repo root."
+    echo "  cd /mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge"
+    echo "  bash scripts/install_runtime_deps.sh"
     exit 1
 fi
 
-# ---- Quick check: are they already installed? ----
-need_install=0
-if [[ "$FORCE" -eq 1 ]]; then
-    need_install=1
-    echo "[install_runtime_deps] --force: will reinstall all three"
+REPO_ROOT="$(pwd)"
+
+# ---------------------------------------------------------------------------
+# 1. Verify venv
+# ---------------------------------------------------------------------------
+if [[ ! -x "${VENV_PY}" ]]; then
+    echo "[install_runtime_deps] FATAL: venv python not found at ${VENV_PY}"
+    echo "  Is the qwen35-mbridge container running?"
+    exit 1
+fi
+echo "[install_runtime_deps] venv: ${VENV_DIR}"
+"${VENV_PY}" -c "import torch; print('  torch:', torch.__version__)"
+"${VENV_PY}" -c "import transformer_engine; print('  TE:   ', transformer_engine.__version__)"
+
+# ---------------------------------------------------------------------------
+# 2. Initialize Megatron-LM submodule if empty
+# ---------------------------------------------------------------------------
+MCORE_INIT="${REPO_ROOT}/3rdparty/Megatron-LM/megatron/core/__init__.py"
+if [[ ! -f "${MCORE_INIT}" ]]; then
+    echo "[install_runtime_deps] 3rdparty/Megatron-LM submodule is empty — initializing..."
+    git submodule update --init --recursive
+    if [[ ! -f "${MCORE_INIT}" ]]; then
+        echo "[install_runtime_deps] FATAL: submodule init failed; ${MCORE_INIT} still missing"
+        exit 1
+    fi
+    echo "[install_runtime_deps] submodule OK"
 else
-    for pkg in mamba_ssm causal_conv1d fla; do
-        if ! "$VENV_PY" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('$pkg') else 1)" 2>/dev/null; then
-            echo "[install_runtime_deps] missing: $pkg"
-            need_install=1
-        fi
-    done
+    echo "[install_runtime_deps] submodule already initialized"
 fi
 
-if [[ "$need_install" -eq 0 ]]; then
-    echo "[install_runtime_deps] all three (mamba_ssm / causal_conv1d / fla) already installed; nothing to do."
-    echo "[install_runtime_deps] (use --force to reinstall)"
-    exit 0
+# ---------------------------------------------------------------------------
+# 3. uv sync — install megatron-core (editable) + all pyproject.toml deps
+#    Skip packages provided by NGC image or already baked into the image.
+# ---------------------------------------------------------------------------
+echo "[install_runtime_deps] running uv sync (megatron-core + Python deps)..."
+
+FORCE_FLAG=""
+[[ "${FORCE}" -eq 1 ]] && FORCE_FLAG="--reinstall"
+
+UV_PROJECT_ENVIRONMENT="${VENV_DIR}" \
+"${VENV_UV}" sync \
+    --link-mode copy \
+    --all-extras \
+    --all-groups \
+    ${FORCE_FLAG} \
+    --no-install-package torch \
+    --no-install-package torchvision \
+    --no-install-package triton \
+    --no-install-package transformer-engine \
+    --no-install-package transformer-engine-torch \
+    --no-install-package transformer-engine-cu12 \
+    --no-install-package flash-attn \
+    --no-install-package mamba-ssm \
+    --no-install-package causal-conv1d \
+    --no-install-package nvidia-cublas \
+    --no-install-package nvidia-cublas-cu12 \
+    --no-install-package nvidia-cublas-cu13 \
+    --no-install-package nvidia-cuda-cupti \
+    --no-install-package nvidia-cuda-cupti-cu12 \
+    --no-install-package nvidia-cuda-cupti-cu13 \
+    --no-install-package nvidia-cuda-nvrtc \
+    --no-install-package nvidia-cuda-nvrtc-cu12 \
+    --no-install-package nvidia-cuda-nvrtc-cu13 \
+    --no-install-package nvidia-cuda-runtime \
+    --no-install-package nvidia-cuda-runtime-cu12 \
+    --no-install-package nvidia-cuda-runtime-cu13 \
+    --no-install-package nvidia-cudnn-cu12 \
+    --no-install-package nvidia-cudnn-cu13 \
+    --no-install-package nvidia-cufft \
+    --no-install-package nvidia-cufft-cu12 \
+    --no-install-package nvidia-cufft-cu13 \
+    --no-install-package nvidia-cufile \
+    --no-install-package nvidia-curand \
+    --no-install-package nvidia-curand-cu12 \
+    --no-install-package nvidia-curand-cu13 \
+    --no-install-package nvidia-cusolver \
+    --no-install-package nvidia-cusolver-cu12 \
+    --no-install-package nvidia-cusolver-cu13 \
+    --no-install-package nvidia-cusparse \
+    --no-install-package nvidia-cusparse-cu12 \
+    --no-install-package nvidia-cusparse-cu13 \
+    --no-install-package nvidia-cusparselt-cu12 \
+    --no-install-package nvidia-cusparselt-cu13 \
+    --no-install-package nvidia-nccl-cu12 \
+    --no-install-package nvidia-nccl-cu13 \
+    --no-install-package nvidia-nvjitlink \
+    --no-install-package nvidia-nvjitlink-cu12 \
+    --no-install-package nvidia-nvjitlink-cu13 \
+    --no-install-package nvidia-nvshmem-cu12 \
+    --no-install-package nvidia-nvshmem-cu13 \
+    --no-install-package nvidia-nvtx \
+    --no-install-package nvidia-nvtx-cu12 \
+    --no-install-package nvidia-nvtx-cu13 \
+    --no-install-package cuda-toolkit \
+    --no-install-package apex
+
+echo "[install_runtime_deps] uv sync done"
+
+# ---------------------------------------------------------------------------
+# 4. Install megatron-bridge itself as editable (points at /mnt source tree)
+# ---------------------------------------------------------------------------
+echo "[install_runtime_deps] installing megatron-bridge editable from ${REPO_ROOT}..."
+
+"${VENV_UV}" pip install \
+    --link-mode copy \
+    --python "${VENV_PY}" \
+    --no-deps \
+    ${FORCE_FLAG} \
+    -e "${REPO_ROOT}"
+
+# Verify it resolves to the /mnt path (not /opt)
+MBRIDGE_FILE=$("${VENV_PY}" -c "import megatron.bridge; print(megatron.bridge.__file__)")
+echo "[install_runtime_deps] megatron.bridge → ${MBRIDGE_FILE}"
+if [[ "${MBRIDGE_FILE}" != "${REPO_ROOT}"* ]]; then
+    echo "[install_runtime_deps] WARNING: megatron.bridge resolved to ${MBRIDGE_FILE}"
+    echo "  expected path under ${REPO_ROOT}"
+    echo "  There may be a stale .pth in the venv pointing elsewhere."
 fi
 
-# ---- Verify GPU / nvcc available (these are nvcc compiles) ----
-if ! command -v nvcc >/dev/null 2>&1; then
-    echo "[install_runtime_deps] FATAL: nvcc not on PATH; cannot compile mamba-ssm / causal-conv1d"
-    exit 1
-fi
-
-# ---- Use uv if present, else fall back to pip ----
-INSTALL_CMD=(
-    "$VENV_PY" -m pip install --no-cache-dir
-)
-if command -v uv >/dev/null 2>&1; then
-    INSTALL_CMD=(
-        uv pip install --link-mode copy --python "$VENV_PY"
-    )
-fi
-
-echo "[install_runtime_deps] installing flash-linear-attention==${FLA_VERSION} (pure python, ~30s)"
-"${INSTALL_CMD[@]}" --no-deps "flash-linear-attention==${FLA_VERSION}"
-
-echo "[install_runtime_deps] installing causal-conv1d==${CAUSAL_CONV1D_VERSION} (nvcc compile, ~3-8 min)"
-"${INSTALL_CMD[@]}" --no-build-isolation --no-deps \
-    "causal-conv1d==${CAUSAL_CONV1D_VERSION}"
-
-echo "[install_runtime_deps] installing mamba-ssm==${MAMBA_SSM_VERSION} (nvcc compile, ~5-15 min)"
-"${INSTALL_CMD[@]}" --no-build-isolation --no-deps \
-    "mamba-ssm==${MAMBA_SSM_VERSION}"
-
-# ---- Verify ----
-echo "[install_runtime_deps] verifying imports (with GPU)..."
-"$VENV_PY" - <<'PYEOF'
+# ---------------------------------------------------------------------------
+# 5. Verify baked-in packages (mamba_ssm, causal_conv1d, fla)
+# ---------------------------------------------------------------------------
+echo "[install_runtime_deps] verifying baked-in packages..."
+"${VENV_PY}" - <<'PYEOF'
 import sys
 ok = True
 for name in ("mamba_ssm", "causal_conv1d", "fla"):
@@ -106,4 +193,5 @@ for name in ("mamba_ssm", "causal_conv1d", "fla"):
 sys.exit(0 if ok else 1)
 PYEOF
 
-echo "[install_runtime_deps] done."
+echo "[install_runtime_deps] all done — container is ready to run training."
+echo "  Next: RANK=<N> MASTER_PORT=23456 bash /mnt/.../start.sh"
