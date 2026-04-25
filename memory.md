@@ -183,7 +183,7 @@ Inside-container env vars:
 | Recipe | Mode | Min GPUs | TP / PP / EP | LR | GBS | Notes |
 |--------|------|----------|--------------|-----|-----|-------|
 | `qwen35_vl_122b_a10b_peft_config` | LoRA | **16** (2 node × 8) | 2 / 1 / 8 | 2e-4 | 36 | **Current demo target.** Fits cleanly on L20Y 80G. |
-| `qwen35_vl_122b_a10b_sft_config` | Full SFT | 32 nominal (4 node × 8) | 2 / 6 / 8 default | 2e-5 | 36 | Default math is 2×6×8=96 GPU; on 32 GPU override to TP=2 PP=4 EP=8 + DP=2. |
+| `qwen35_vl_122b_a10b_sft_config` | Full SFT | 32 nominal (4 node × 8) | 2 / 6 / 8 default | 2e-5 | 36 | Default math is 2×6×8=96 GPU; on 32 GPU override to TP=2 PP=4 **EP=4** DP=4. EP must ≤ DP. |
 | `qwen35_vl_35b_a3b_peft_config` | LoRA | 8 (1 node) | 2 / 1 / 4 | 2e-4 | — | Fast iteration on smaller MoE sibling. |
 | `qwen35_vl_122b_a10b_pretrain_mock_config` | Pretrain (mock) | 8+ | — | — | — | Sanity test only; uses random tokens. |
 
@@ -222,6 +222,30 @@ left alone.
 | 13 | `import mamba_ssm` crashes inside `docker build` with `RuntimeError: 0 active drivers` | Build host has no GPU. `@triton.autotune(...)` fires at module load and calls `driver.active.get_benchmarker()`. **Fix:** `Dockerfile.qwen35` build-time sanity uses pure shell (`test -f` / `grep`) — no Python imports. See Dockerfile "Build-time sanity" comment. |
 | 14 | `ValueError: fused_topk_with_score_function is not available. Please install TE >= 2.6.0.` | **Root cause:** `moe_router_fusion=True` in `_qwen35_vl_apply_moe()`. `transformer_engine.pytorch.router` does not exist in TE 2.4; `fused_topk_with_score_function` is `None`. **Analysis:** router topk is < 0.01% of MoE FLOPS (256 experts × topk=8 → ~4K ops vs ~50M ops expert GEMM); unfused path is negligible. Upgrading TE inside NGC breaks ABI (same class as mamba_ssm, Pitfall #10). **Fix (2026-04-25):** `cfg.model.moe_router_fusion = False` in `src/megatron/bridge/recipes/qwen_vl/qwen35_vl.py`. `moe_permute_fusion` and `moe_grouped_gemm` remain `True`. Re-enable only after switching to NGC image with TE ≥ 2.7. |
 | 15 | Training uses stale `/opt/Megatron-Bridge` code instead of `/mnt` source | Old Dockerfile baked source into image; entrypoint fell back to `/opt` when no mount was detected. **Fix (2026-04-25):** New `Dockerfile.qwen35` is a pure env image — no source baked in, `/opt/Megatron-Bridge` does not exist. `install_runtime_deps.sh` does `uv pip install -e <path>` from `/mnt` explicitly. |
+| 16 | `uv sync` silently removes baked-in packages (`mamba_ssm`, `causal_conv1d`, `fla`) | `uv sync` default mode is **exact**: it removes anything not in the lockfile, even packages installed by `pip` at image build time. **Fix (2026-04-26):** Add `--inexact` to the `uv sync` call in `install_runtime_deps.sh`. This makes uv only install missing packages, never remove extras. |
+| 17 | EP > DP assertion / silent memory error on 32 GPU with EP=8 | DP = world_size/(TP×PP) = 32/(2×4) = 4. Megatron-Core requires EP ≤ DP. EP=8 > DP=4 is invalid: triggers assert or wrong memory layout. **Fix (2026-04-26):** Set `EP=4` in `run_sft_qwen35_122b_4node.sh`. |
+| 18 | Non-rank-0 nodes keep megatron.bridge pointing at `/opt` | `run_sft_qwen35_122b_4node.sh` ran `install_runtime_deps.sh` only on rank 0. Non-rank-0 nodes skipped the `uv pip install -e` step → megatron.bridge resolved to stale `/opt` path. **Fix (2026-04-26):** Remove the `if [[ NODE_RANK -eq 0 ]]` guard — run `install_runtime_deps.sh` on **all nodes** unconditionally (it is idempotent). |
+| 19 | Last PP stage OOM while ranks 0-2 are fine (MTP layer imbalance) | `mtp_num_hidden_layers=1` adds one extra transformer block + LM head to the **last pipeline stage only**. On tight 80G GPUs this creates ~6-8 GB extra pressure on rank(PP-1) vs other stages. Symptom: OOM during optimizer-state initialization on last-stage ranks while all other ranks pass. **Fix (2026-04-26):** Set `model.mtp_num_layers=0` in overrides to disable MTP for SFT. See §MTP Memory Note for cost of re-enabling. |
+
+## MTP Memory Note (for future re-enablement)
+
+`mtp_num_hidden_layers=1` (the default for Qwen3.5-122B-A10B) places one extra
+transformer block on the **last PP stage only**. Memory cost per GPU on that stage:
+
+| Component | Estimate (TP=2, EP=4, DP=4, PP=4) |
+|-----------|------------------------------------|
+| MTP block params bf16 | ~244 GB / 48 layers / TP=2 / PP-stage ≈ **2.5 GB** |
+| MTP block grads bf16 | ~2.5 GB |
+| Adam optimizer fp32 (ZeRO-1 / DP=4) | ~2 × 2.5 / 4 ≈ **1.25 GB** |
+| **Total extra on last stage** | **~6–7 GB** |
+
+To re-enable MTP (`model.mtp_num_layers=1`) the last PP stage needs ~6-7 GB
+of additional headroom. Options (in order of preference):
+1. Increase PP (e.g. PP=6 on 48 nodes) — fewer layers per stage, less activation memory
+2. Use `SEQ=1024` (further activation reduction)
+3. Use TP=4 (halves per-GPU param/grad pressure, requires 2× TP bandwidth)
+
+Do **not** re-enable MTP until the baseline full-SFT demo runs successfully.
 
 ## Mamba-SSM ABI Workaround (NGC nv25.06)
 
@@ -293,8 +317,8 @@ Fresh containers have all three deps + patch ready immediately.
 | A. Env on cluster (NGC container) | ✅ Done | `/opt/venv-mbridge/bin/python` works, all NGC libs OK |
 | B. HF → mcore conversion | ✅ Done (pre-existing, 234 GB) | `/mnt/tidal-alsh01/dataset/redone/hade/data/Qwen3.5-122B-A10B-mcore` |
 | C. Pure-env image + /mnt runtime | ✅ Done (2026-04-25) | `Dockerfile.qwen35`, `scripts/install_runtime_deps.sh` |
-| D. 2-node × 8-GPU LoRA SFT demo | 🟡 Blocked by Pitfall #14 fix; ready to retry | `scripts/run_sft_qwen35_122b_2node_lora.sh` via `start.sh` |
-| E. 4-node × 8-GPU full SFT | 🟡 Script ready, not yet executed | `scripts/run_sft_qwen35_122b_4node.sh` |
+| D. 2-node × 8-GPU LoRA SFT demo | ⏳ Deferred (user prefers full SFT) | `scripts/run_sft_qwen35_122b_2node_lora.sh` via `start.sh` |
+| E. 4-node × 8-GPU full SFT | 🟡 In progress — OOM resolved (EP=4, MTP=0, SEQ=2048, expandable_segments) | `scripts/run_sft_qwen35_122b_4node.sh` |
 | F. Real internal multimodal data | ⏳ Pending — no real images yet | needs spec |
 
 ## Open Questions (pending user)
@@ -310,4 +334,4 @@ Older bare-metal venv setup (cu128 + TE 2.7 + flash-attn 2.8.1, single-node
 H20-141G, `/data/temp/...` paths), old Dockerfile iteration history (with
 `COPY` + editable install baked in), conversion debugging — see `memory_legacy.md`.
 
-_Last updated: 2026-04-25 (pure-env image design; install_runtime_deps.sh redesign; Pitfall #14 moe_router_fusion=False; Pitfall #15 stale /opt code; ALWAYS/NEVER boundaries updated)_
+_Last updated: 2026-04-26 (Pitfall #16 uv sync --inexact; Pitfall #17 EP>DP invalid on 32GPU; Pitfall #18 install_runtime_deps on all nodes; Pitfall #19 MTP last-stage OOM; MTP memory note added; Standard Recipes EP corrected to EP=4; Stage D deferred, Stage E in progress with SEQ=2048 MTP=0)_
