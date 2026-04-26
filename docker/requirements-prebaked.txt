@@ -73,6 +73,15 @@ open-clip-torch>=3.2.0
 qwen-vl-utils
 
 # ==============================================================================
+# NGC compatibility pins
+# ==============================================================================
+# NGC 25.06 ships cudf/pylibcudf 25.4.0 which require pyarrow<20.0.0.
+# mlflow (a transitive dep pulled here) would otherwise resolve pyarrow>=20,
+# breaking cudf. Pin an upper bound to stay compatible.
+# Note: megatron-bridge itself only needs pyarrow>=14.0.0 (parquet extra).
+pyarrow>=14.0.0,<20.0.0
+
+# ==============================================================================
 # CVE security overrides  (mirrors [tool.uv.override-dependencies])
 # ==============================================================================
 urllib3>=2.6.3          # CVE-2026-21441

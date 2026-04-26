@@ -255,6 +255,7 @@ RUN ${VENV_DIR}/bin/pip install --no-cache-dir \
 # ------------------------------------------------------------------------------
 RUN set -e; \
     SP=${VENV_DIR}/lib/python3.12/site-packages; \
+    SP_NGC=/usr/local/lib/python3.12/dist-packages; \
     echo "=== Build-time sanity (file-presence only, no GPU required) ==="; \
     echo "--- baked-in wheels (causal-conv1d, mamba-ssm, fla) ---"; \
     for f in \
@@ -271,6 +272,7 @@ RUN set -e; \
         && echo "  ok    mamba_ssm ABI patch present" \
         || { echo "  FAIL  mamba_ssm patch missing"; exit 1; }; \
     echo "--- prebaked pure-Python deps (spot check) ---"; \
+    echo "    (checking venv SP and NGC dist-packages; either location is OK)"; \
     for f in \
         transformers/__init__.py \
         peft/__init__.py \
@@ -288,9 +290,13 @@ RUN set -e; \
         pytest/__init__.py \
         ruff/__main__.py \
     ; do \
-        test -f "$SP/$f" \
-            && echo "  ok    $f" \
-            || { echo "  FAIL  $f"; exit 1; }; \
+        if test -f "$SP/$f"; then \
+            echo "  ok    $f  (venv)"; \
+        elif test -f "$SP_NGC/$f"; then \
+            echo "  ok    $f  (NGC)"; \
+        else \
+            echo "  FAIL  $f"; exit 1; \
+        fi; \
     done; \
     echo "=== sanity OK ==="
 
