@@ -179,22 +179,23 @@ if [[ "${MBRIDGE_FILE}" != "${REPO_ROOT}"* ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4b. TE 2.4 compatibility: inject te.pytorch.distributed as a module attribute.
+# 4b. TE 2.4 compatibility: clean up any stale te_distributed_compat.pth.
 #
-# megatron/core/extensions/transformer_engine.py (Megatron-LM commit 9978968)
-# references `te.pytorch.distributed.CudaRNGStatesTracker` at class-definition
-# time (module top-level, not inside a function). After `import transformer_engine
-# as te`, the `.pytorch.distributed` submodule is NOT automatically accessible
-# as an attribute chain unless it has been explicitly imported.
-# TE 2.4 has the submodule at transformer_engine.pytorch.distributed but does
-# not auto-expose it. A .pth file in site-packages is executed at Python startup,
-# which causes the submodule to be imported and wired as an attribute before any
-# megatron import runs. This avoids touching 3rdparty/ (NEVER boundary).
+# Historical note: an earlier version of this script wrote a .pth file to
+# site-packages to force `import transformer_engine.pytorch.distributed` at
+# Python startup. This was unsound: Python's site module processes venv
+# .pth files BEFORE adding /usr/local/lib (NGC dist-packages) to sys.path,
+# so the import fails with ModuleNotFoundError on every fresh container start.
+# The fix (2026-04-26) is to do the import explicitly in run_recipe.py after
+# the process is fully initialized, at which point sys.path is complete.
+# Remove any leftover .pth file so it does not cause spurious errors.
 # ---------------------------------------------------------------------------
 SITE_PACKAGES="$("${VENV_PY}" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 TE_COMPAT_PTH="${SITE_PACKAGES}/te_distributed_compat.pth"
-echo "import transformer_engine.pytorch.distributed" > "${TE_COMPAT_PTH}"
-echo "[install_runtime_deps] wrote TE compat pth: ${TE_COMPAT_PTH}"
+if [[ -f "${TE_COMPAT_PTH}" ]]; then
+    rm -f "${TE_COMPAT_PTH}"
+    echo "[install_runtime_deps] removed stale TE compat pth: ${TE_COMPAT_PTH}"
+fi
 
 # ---------------------------------------------------------------------------
 # 5. Verify packages baked into the image (mamba_ssm, causal_conv1d, fla).

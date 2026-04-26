@@ -107,6 +107,18 @@ import argparse
 import inspect
 from typing import Callable
 
+# TE 2.4 compatibility: `import transformer_engine as te` does NOT
+# automatically expose te.pytorch.distributed as an attribute chain.
+# megatron/core/extensions/transformer_engine.py references
+# te.pytorch.distributed.CudaRNGStatesTracker at class-definition time
+# (module top-level), so the submodule must be imported before any
+# megatron.core import. Doing it here (not in a .pth file) ensures
+# sys.path is fully initialized and NGC dist-packages are visible.
+try:
+    import transformer_engine.pytorch.distributed  # noqa: F401
+except ImportError:
+    pass  # TE not available; megatron.core will handle gracefully via MagicMock
+
 import megatron.bridge.recipes as recipes
 
 # Diffusion forward steps: use class instances so they can be passed as forward_step_func

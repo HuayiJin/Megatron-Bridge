@@ -71,11 +71,7 @@ EP="${EP:-4}"
 # ---------------------------------------------------------------------------
 RECIPE="${RECIPE:-qwen35_vl_122b_a10b_sft_config}"
 ITERS="${ITERS:-20}"
-# SEQ=1024: reduced to give Triton autotuner workspace headroom on first backward.
-# GDN (chunk_gated_delta_rule) autotuner needs ~6-8 GB extra during benchmark;
-# at SEQ=2048 the GPU is too full. Once autotune cache is warm (TRITON_CACHE_DIR)
-# this can be raised back to 2048 or 4096.
-SEQ="${SEQ:-1024}"
+SEQ="${SEQ:-2048}"
 GBS="${GBS:-32}"
 MBS="${MBS:-1}"
 LOG_INTERVAL="${LOG_INTERVAL:-1}"
@@ -116,17 +112,16 @@ export MBRIDGE_PATCH_NVIDIA_FILE="${MBRIDGE_PATCH_NVIDIA_FILE:-0}"
 export MBRIDGE_DISABLE_CUDNN="${MBRIDGE_DISABLE_CUDNN:-0}"
 # Reduce allocator fragmentation (helps with optimizer-state OOM on 80G GPUs)
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-# Persist Triton autotune cache across container restarts (NAS path survives).
-# GDN backward kernel (chunk_bwd_kernel_dqkwg) autotunes on first backward;
-# without a warm cache it needs ~6-8 GB extra workspace → OOM on tight 80G GPUs.
-# Pre-warm: run one successful step (SEQ=1024) → cache populated → raise SEQ.
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/triton_cache}"
-mkdir -p "$TRITON_CACHE_DIR"
 export MBRIDGE_PATCH_GRAD_FUSION="${MBRIDGE_PATCH_GRAD_FUSION:-0}"
-export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+# Limit NCCL debug to init phase only, to avoid log explosion during training.
+# Set NCCL_DEBUG_SUBSYS=ALL to see everything, but that will be very verbose.
+export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT}"
 export PYTHONUNBUFFERED=1
 export TORCH_NCCL_AVOID_RECORD_STREAMS="${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+# Do NOT set CUDA_LAUNCH_BLOCKING — it serializes all CUDA ops and breaks NCCL async.
+# Do NOT override NCCL_SOCKET_IFNAME here — the cluster injects bond1 correctly.
 export HF_HOME="${HF_HOME:-/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/hf_cache}"
 mkdir -p "$HF_HOME"
 
