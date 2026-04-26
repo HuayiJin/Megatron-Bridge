@@ -122,6 +122,13 @@ export TORCH_NCCL_AVOID_RECORD_STREAMS="${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 # Do NOT set CUDA_LAUNCH_BLOCKING — it serializes all CUDA ops and breaks NCCL async.
 # Do NOT override NCCL_SOCKET_IFNAME here — the cluster injects bond1 correctly.
+# Pitfall #22: FLA Triton autotuner OOM during backward.
+# chunk_gated_delta_rule_bwd triggers triton autotuner benchmarking on the first
+# backward pass. Each candidate config allocates extra temp tensors while model
+# activations are still live, pushing peak VRAM well beyond 80G.
+# FLA_AUTOTUNE=0 skips benchmarking and uses the default config immediately.
+# Typical throughput penalty: 5-15% vs. fully tuned — acceptable for training.
+export FLA_AUTOTUNE="${FLA_AUTOTUNE:-0}"
 export HF_HOME="${HF_HOME:-/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/hf_cache}"
 mkdir -p "$HF_HOME"
 

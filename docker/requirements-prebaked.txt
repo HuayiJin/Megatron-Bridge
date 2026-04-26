@@ -1,0 +1,111 @@
+# docker/requirements-prebaked.txt
+#
+# Stable pure-Python (and nvidia-resiliency-ext) dependencies pre-installed
+# into /opt/venv-mbridge at IMAGE BUILD TIME to accelerate runtime `uv sync`.
+#
+# Design contract
+# ---------------
+# 1. These packages do NOT depend on /mnt NAS source code (megatron-core and
+#    megatron-bridge editable installs are intentionally absent).
+# 2. Versions mirror pyproject.toml constraints; do NOT lock to exact versions
+#    here — pip resolves latest compatible at image build time.
+# 3. Packages provided by the NGC base image (torch, torchvision, triton,
+#    transformer-engine, flash-attn, apex, causal-conv1d, mamba-ssm,
+#    flash-linear-attention, fla-core, and all nvidia-cuda-* libs) are
+#    intentionally absent — they are already present in /opt/venv-mbridge via
+#    --system-site-packages and the explicit wheel installs in the Dockerfile.
+# 4. install_runtime_deps.sh remains fully backward-compatible: `uv sync`
+#    detects that these packages are already installed and skips them, making
+#    the runtime step only need to install megatron-core + megatron-bridge.
+#
+# Maintenance
+# -----------
+# When pyproject.toml gains new pure-Python dependencies, add them here and
+# rebuild the image. When a dependency is removed from pyproject.toml, remove
+# it here too. No image rebuild is needed for megatron-core or megatron-bridge
+# changes — those are always installed at runtime from /mnt.
+#
+# nvidia-resiliency-ext is installed from the NVIDIA PyPI index; the Dockerfile
+# passes --extra-index-url https://pypi.nvidia.com when invoking pip here.
+
+# ==============================================================================
+# Core training dependencies  (mirrors [project.dependencies] in pyproject.toml)
+# ==============================================================================
+
+# HuggingFace ecosystem
+transformers>=5.0.0,<=5.3.0
+peft>=0.18.1
+datasets>=2.20.0
+accelerate
+diffusers>=0.36.0
+
+# Tensor / math utilities
+einops
+imageio
+imageio-ffmpeg
+regex>=2024.11.6
+
+# Configuration / logging / monitoring
+omegaconf>=2.3.0
+pyyaml>=6.0.2
+hydra-core>1.3,<=1.3.2
+tensorboard>=2.19.0
+rich
+tqdm>=4.67.1
+wandb>=0.25.0
+mlflow>=3.9.0          # CVE-2025-15031
+comet-ml>=3.50.0
+
+# Typing / compat
+typing-extensions
+six>=1.17.0
+
+# Vision / multimodal
+timm
+open-clip-torch>=3.2.0
+qwen-vl-utils
+
+# NVIDIA resiliency (from https://pypi.nvidia.com — needs --extra-index-url)
+nvidia-resiliency-ext
+
+# ==============================================================================
+# CVE security overrides  (mirrors [tool.uv.override-dependencies])
+# ==============================================================================
+urllib3>=2.6.3          # CVE-2026-21441
+cachetools>=5.0.0
+cryptography>=43.0.0,<47
+
+# ==============================================================================
+# Optional extras worth pre-baking (parquet, recipes)
+# ==============================================================================
+pyarrow>=14.0.0
+nemo-run
+
+# ==============================================================================
+# Test / dev / docs groups  (mirrors [dependency-groups] in pyproject.toml)
+# ==============================================================================
+
+# test
+coverage>=7.8.1
+pytest>=8.3.5
+pytest-timeout>=2.4.0
+pytest-mock>=3.14.0
+pytest-runner>=6.0.1
+pygithub
+click
+flake8>=7.2.0
+pylint>=3.3.7
+
+# dev
+pre-commit>=3.6.0
+ruff>=0.9.9
+mypy>=1.8.0
+
+# docs
+myst-parser>=4.0.1
+sphinx>=8.1.3
+sphinx-autobuild>=2024.10.3
+sphinx-autodoc2>=0.5.0
+sphinx-copybutton>=0.5.2
+sphinxcontrib-mermaid
+nvidia-sphinx-theme>=0.0.8

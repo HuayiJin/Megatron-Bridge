@@ -7,12 +7,19 @@
 #   APEX (with cuda ext) / flash-attn 2.7.4 — ALL inherited verbatim.
 #
 # What this image contains:
-#   - OS tools (git, tmux, curl, …)
+#   - OS tools (git, tmux, curl, …) + timezone set to Asia/Shanghai (UTC+8)
 #   - uv (package manager)
 #   - /opt/venv-mbridge: a venv that inherits NGC site-packages, plus:
 #       causal-conv1d 1.6.1 + mamba-ssm 2.3.1 (prebuilt wheels, ABI-patched)
 #       flash-linear-attention 0.4.2 + fla-core 0.4.2 (pure Python, network install)
+#       ALL stable pure-Python deps from docker/requirements-prebaked.txt:
+#         transformers, peft, datasets, accelerate, diffusers, omegaconf,
+#         tensorboard, wandb, hydra-core, timm, open-clip-torch, mlflow,
+#         comet-ml, nvidia-resiliency-ext, pytest, ruff, mypy, pre-commit, …
 #   - mamba_ssm/__init__.py ABI patch (makes import non-fatal on NGC torch 2.8a)
+#
+# Runtime `uv sync` only needs to install megatron-core + megatron-bridge (~1 min
+# vs ~10 min on images without prebaked deps).
 #
 # What this image does NOT contain:
 #   - Megatron-Bridge source code  ← lives on NAS, mounted at runtime
@@ -63,6 +70,7 @@ ARG FLA_VERSION=0.4.2
 # Runtime environment
 # ------------------------------------------------------------------------------
 ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Shanghai \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONUNBUFFERED=1 \
@@ -76,10 +84,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=${VENV_DIR}/bin:${PATH}
 
 # ------------------------------------------------------------------------------
-# OS deps
+# OS deps + timezone (Asia/Shanghai / UTC+8)
+# tzdata is installed non-interactively; DEBIAN_FRONTEND=noninteractive is
+# already set in the ENV block above so no debconf prompt appears.
 # ------------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git git-lfs ninja-build cmake curl ca-certificates jq tmux less \
+        tzdata \
+    && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
 # ------------------------------------------------------------------------------
@@ -91,15 +104,23 @@ RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
 
 # ------------------------------------------------------------------------------
 # Create venv inheriting NGC's whole site-packages.
-# Verify key NGC packages are present (Python import OK on build host — these
-# are pure-Python metadata checks, no CUDA driver needed).
+# Verify key NGC packages are present via file-presence checks only — no
+# Python imports here because the build host has no GPU / CUDA driver, and
+# importing torch / TE / flash-attn / APEX would fail on CUDA ext init.
 # ------------------------------------------------------------------------------
 RUN uv venv ${VENV_DIR} --python /usr/bin/python3.12 \
         --system-site-packages --seed && \
-    ${VENV_DIR}/bin/python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.version.cuda)" && \
-    ${VENV_DIR}/bin/python -c "import transformer_engine; print('TE:', transformer_engine.__version__)" && \
-    ${VENV_DIR}/bin/python -c "import flash_attn; print('flash-attn:', flash_attn.__version__)" && \
-    ${VENV_DIR}/bin/python -c "import fused_weight_gradient_mlp_cuda; print('APEX cuda ext: OK')"
+    SP_NGC=/usr/local/lib/python3.12/dist-packages; \
+    for f in \
+        torch/__init__.py \
+        transformer_engine/__init__.py \
+        flash_attn/__init__.py \
+        apex/__init__.py \
+    ; do \
+        test -f "$SP_NGC/$f" \
+            && echo "  ok (NGC)  $f" \
+            || { echo "  FAIL (NGC)  $f — is base image correct?"; exit 1; }; \
+    done
 
 # ------------------------------------------------------------------------------
 # Install causal-conv1d + mamba-ssm prebuilt wheels.
@@ -191,12 +212,43 @@ except BaseException:
 PYEOF
 
 # ------------------------------------------------------------------------------
+# Pre-bake stable pure-Python dependencies (and nvidia-resiliency-ext) into
+# the venv at image build time.  This offloads the bulk of `uv sync` work from
+# every container launch to a one-time image build step.
+#
+# Key design decisions (no-GPU build host safe):
+#   - pip install, NOT uv sync: avoids needing pyproject.toml / uv.lock in the
+#     image, so the image stays stable even as pyproject.toml evolves.
+#   - --no-deps is NOT used: we want transitive deps resolved by pip here.
+#   - Packages already in the NGC image (torch, TE, flash-attn, apex,
+#     causal-conv1d, mamba-ssm, flash-linear-attention, fla-core, nvidia-cuda-*)
+#     are absent from requirements-prebaked.txt; pip skips reinstalling them
+#     because they satisfy the version constraints.
+#   - nvidia-resiliency-ext comes from https://pypi.nvidia.com (NVIDIA PyPI).
+#   - megatron-core and megatron-bridge are intentionally absent — they require
+#     the /mnt NAS source tree and are installed at runtime by
+#     scripts/install_runtime_deps.sh.
+#   - Backward compatibility: install_runtime_deps.sh is unchanged in behavior.
+#     `uv sync` detects pre-installed packages via the venv's site-packages and
+#     skips re-downloading them, reducing runtime setup from ~10 min to ~1 min.
+#
+# To update: edit docker/requirements-prebaked.txt and rebuild the image.
+# ------------------------------------------------------------------------------
+COPY docker/requirements-prebaked.txt /tmp/requirements-prebaked.txt
+
+RUN ${VENV_DIR}/bin/pip install --no-cache-dir \
+        --extra-index-url https://pypi.nvidia.com \
+        -r /tmp/requirements-prebaked.txt \
+    && rm /tmp/requirements-prebaked.txt
+
+# ------------------------------------------------------------------------------
 # Build-time sanity — pure shell, no Python imports (no GPU on build host).
 # See memory.md Pitfall #13.
 # ------------------------------------------------------------------------------
 RUN set -e; \
     SP=${VENV_DIR}/lib/python3.12/site-packages; \
-    echo "=== Build-time sanity (file-presence only) ==="; \
+    echo "=== Build-time sanity (file-presence only, no GPU required) ==="; \
+    echo "--- baked-in wheels (causal-conv1d, mamba-ssm, fla) ---"; \
     for f in \
         causal_conv1d/__init__.py \
         mamba_ssm/__init__.py \
@@ -210,6 +262,28 @@ RUN set -e; \
     grep -q "NGC nv25.06 patched torch" "$SP/mamba_ssm/__init__.py" \
         && echo "  ok    mamba_ssm ABI patch present" \
         || { echo "  FAIL  mamba_ssm patch missing"; exit 1; }; \
+    echo "--- prebaked pure-Python deps (spot check) ---"; \
+    for f in \
+        transformers/__init__.py \
+        peft/__init__.py \
+        datasets/__init__.py \
+        accelerate/__init__.py \
+        diffusers/__init__.py \
+        einops/__init__.py \
+        omegaconf/__init__.py \
+        tensorboard/__init__.py \
+        wandb/__init__.py \
+        hydra/__init__.py \
+        timm/__init__.py \
+        mlflow/__init__.py \
+        nvidia_resiliency_ext/__init__.py \
+        pytest/__init__.py \
+        ruff/__main__.py \
+    ; do \
+        test -f "$SP/$f" \
+            && echo "  ok    $f" \
+            || { echo "  FAIL  $f"; exit 1; }; \
+    done; \
     echo "=== sanity OK ==="
 
 # ------------------------------------------------------------------------------

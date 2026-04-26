@@ -19,4 +19,10 @@ VENV_DIR="${MBRIDGE_VENV_DIR:-/opt/venv-mbridge}"
 # Ensure venv is first on PATH (Dockerfile ENV already sets this; safety net).
 export PATH="${VENV_DIR}/bin:${PATH}"
 
+# Ensure timezone is Asia/Shanghai (UTC+8).
+# The Dockerfile sets TZ=Asia/Shanghai and symlinks /etc/localtime; this export
+# makes TZ visible to Python's datetime / logging even if the host overrides it
+# via a bind-mounted /etc/localtime.
+export TZ="${TZ:-Asia/Shanghai}"
+
 exec "$@"

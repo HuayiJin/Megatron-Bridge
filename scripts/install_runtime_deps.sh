@@ -12,9 +12,16 @@
 #      already provided by the NGC base image (torch, TE, flash-attn, etc.)
 #      and packages already baked into the image (mamba-ssm, causal-conv1d,
 #      flash-linear-attention, fla-core).
+#      NOTE: Most pure-Python packages (transformers, peft, datasets, etc.) and
+#      nvidia-resiliency-ext are pre-installed in the image via
+#      docker/requirements-prebaked.txt. `uv sync` detects them in site-packages
+#      and skips re-downloading, making this step fast (~1 min vs ~10 min).
+#      This script is fully backward-compatible: it works identically on images
+#      built before the prebaked optimization was introduced.
 #   4. Run `uv pip install -e .` to install megatron-bridge itself (editable,
 #      pointing at the /mnt source tree so live edits are picked up).
-#   5. Verify baked-in packages (mamba_ssm, causal_conv1d, fla) import OK.
+#   5. Verify baked-in packages (mamba_ssm, causal_conv1d, fla) and a sample
+#      of prebaked packages (transformers, nvidia_resiliency_ext) import OK.
 #
 # Idempotent:
 #   Steps 3-4 are fast no-ops if already installed (uv detects no changes).
@@ -198,22 +205,63 @@ if [[ -f "${TE_COMPAT_PTH}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Verify packages baked into the image (mamba_ssm, causal_conv1d, fla).
-#    fla is installed at image build time via `pip install flash-linear-attention`
-#    (which pulls fla-core); it is NOT installed by uv sync above.
+# 5. Verify packages baked into the image.
+#
+#    Group A — wheel-installed at image build time (always present):
+#      mamba_ssm, causal_conv1d, fla
+#      fla is installed via `pip install flash-linear-attention` (pulls
+#      fla-core); it is NOT installed by uv sync above.
+#
+#    Group B — prebaked pure-Python packages (present on images built after
+#      the docker/requirements-prebaked.txt optimization; absent on older
+#      images).  We verify these with a best-effort check and print a warning
+#      rather than failing, so the script remains backward-compatible.
 # ---------------------------------------------------------------------------
-echo "[install_runtime_deps] verifying baked-in packages..."
+echo "[install_runtime_deps] verifying baked-in and prebaked packages..."
 "${VENV_PY}" - <<'PYEOF'
 import sys
+
 ok = True
-for name in ("mamba_ssm", "causal_conv1d", "fla"):
+
+# Group A: must always be present (hard failure)
+required = ("mamba_ssm", "causal_conv1d", "fla")
+for name in required:
     try:
         m = __import__(name)
         v = getattr(m, "__version__", "<no version>")
-        print(f"  ok    {name:18s} {v}")
+        print(f"  ok    {name:26s} {v}")
     except Exception as exc:
-        print(f"  FAIL  {name:18s} {type(exc).__name__}: {exc}")
+        print(f"  FAIL  {name:26s} {type(exc).__name__}: {exc}")
         ok = False
+
+# Group B: prebaked packages — soft check (warn but don't fail on old images)
+prebaked_sample = (
+    "transformers",
+    "peft",
+    "datasets",
+    "accelerate",
+    "omegaconf",
+    "wandb",
+    "nvidia_resiliency_ext",
+)
+prebaked_missing = []
+for name in prebaked_sample:
+    try:
+        m = __import__(name)
+        v = getattr(m, "__version__", "<no version>")
+        print(f"  ok    {name:26s} {v}  [prebaked]")
+    except Exception:
+        prebaked_missing.append(name)
+
+if prebaked_missing:
+    print(
+        f"\n  NOTE: {len(prebaked_missing)} prebaked package(s) not found in image "
+        f"({', '.join(prebaked_missing)}).\n"
+        "  This is expected on images built before docker/requirements-prebaked.txt\n"
+        "  was introduced. `uv sync` (step 3) will have installed them already.\n"
+        "  Rebuild the image to get the faster startup benefit."
+    )
+
 sys.exit(0 if ok else 1)
 PYEOF
 
