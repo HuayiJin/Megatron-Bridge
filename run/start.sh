@@ -28,12 +28,21 @@
 
 set -euo pipefail
 
-REPO_ROOT="/mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge"
-WHEEL_DIR="/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/wheels"
-VENV_PY="/opt/venv-mbridge/bin/python"
+# ---------------------------------------------------------------------------
+# Path resolution
+#   REPO_ROOT  — auto-derived from this script's location (run/ subdir).
+#                Override by exporting REPO_ROOT=/your/path before calling.
+#   MEG_RUN_DIR — working directory for wheels, logs, outputs, hf_cache.
+#                Defaults to a sibling directory of REPO_ROOT named "meg-run".
+#                Override by exporting MEG_RUN_DIR=/your/path.
+# ---------------------------------------------------------------------------
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+MEG_RUN_DIR="${MEG_RUN_DIR:-$(dirname "$REPO_ROOT")/meg-run}"
+WHEEL_DIR="${WHEEL_DIR:-${MEG_RUN_DIR}/wheels}"
+VENV_PY="${VENV_PY:-/opt/venv-mbridge/bin/python}"
 
-CAUSAL_WHL="${WHEEL_DIR}/causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
-MAMBA_WHL="${WHEEL_DIR}/mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+CAUSAL_WHL="${CAUSAL_WHL:-${WHEEL_DIR}/causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl}"
+MAMBA_WHL="${MAMBA_WHL:-${WHEEL_DIR}/mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl}"
 
 # ---------------------------------------------------------------------------
 # 0. Sanity

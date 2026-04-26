@@ -27,10 +27,9 @@
 #   Steps 3-4 are fast no-ops if already installed (uv detects no changes).
 #   Run with --force to reinstall everything unconditionally.
 #
-# Usage (run from the repo root on /mnt):
-#   cd /mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge
-#   bash scripts/install_runtime_deps.sh
-#   bash scripts/install_runtime_deps.sh --force   # reinstall unconditionally
+# Usage (can be called from any directory):
+#   bash /path/to/Megatron-Bridge/scripts/install_runtime_deps.sh
+#   bash /path/to/Megatron-Bridge/scripts/install_runtime_deps.sh --force
 
 set -euo pipefail
 
@@ -39,7 +38,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 VENV_DIR="${VENV_DIR:-/opt/venv-mbridge}"
 VENV_PY="${VENV_PY:-${VENV_DIR}/bin/python}"
-VENV_UV="/usr/local/bin/uv"
+VENV_UV="${VENV_UV:-/usr/local/bin/uv}"
 
 FORCE=0
 for arg in "$@"; do
@@ -54,16 +53,17 @@ for arg in "$@"; do
 done
 
 # ---------------------------------------------------------------------------
-# 0. Must run from inside the Megatron-Bridge source tree
+# 0. Locate repo root from this script's own path (no cd required)
 # ---------------------------------------------------------------------------
-if [[ ! -f "pyproject.toml" ]]; then
-    echo "[install_runtime_deps] FATAL: run this script from the Megatron-Bridge repo root."
-    echo "  cd /mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge"
-    echo "  bash scripts/install_runtime_deps.sh"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ ! -f "${REPO_ROOT}/pyproject.toml" ]]; then
+    echo "[install_runtime_deps] FATAL: pyproject.toml not found under ${REPO_ROOT}"
+    echo "  Is this script inside the Megatron-Bridge repo at scripts/install_runtime_deps.sh?"
     exit 1
 fi
 
-REPO_ROOT="$(pwd)"
+cd "${REPO_ROOT}"
 
 # ---------------------------------------------------------------------------
 # 1. Verify venv
@@ -99,8 +99,8 @@ fi
 # ---------------------------------------------------------------------------
 echo "[install_runtime_deps] running uv sync (megatron-core + Python deps)..."
 
-FORCE_FLAG=""
-[[ "${FORCE}" -eq 1 ]] && FORCE_FLAG="--reinstall"
+FORCE_FLAGS=()
+[[ "${FORCE}" -eq 1 ]] && FORCE_FLAGS=("--reinstall")
 
 UV_PROJECT_ENVIRONMENT="${VENV_DIR}" \
 "${VENV_UV}" sync \
@@ -108,7 +108,7 @@ UV_PROJECT_ENVIRONMENT="${VENV_DIR}" \
     --inexact \
     --all-extras \
     --all-groups \
-    ${FORCE_FLAG} \
+    "${FORCE_FLAGS[@]}" \
     --no-install-package torch \
     --no-install-package torchvision \
     --no-install-package triton \
@@ -173,7 +173,7 @@ echo "[install_runtime_deps] installing megatron-bridge editable from ${REPO_ROO
     --link-mode copy \
     --python "${VENV_PY}" \
     --no-deps \
-    ${FORCE_FLAG} \
+    "${FORCE_FLAGS[@]}" \
     -e "${REPO_ROOT}"
 
 # Verify it resolves to the /mnt path (not /opt)
@@ -266,4 +266,4 @@ sys.exit(0 if ok else 1)
 PYEOF
 
 echo "[install_runtime_deps] all done — container is ready to run training."
-echo "  Next: RANK=<N> MASTER_PORT=23456 bash /mnt/.../start.sh"
+echo "  Next: RANK=<N> MASTER_PORT=23456 bash run/start_4node.sh"

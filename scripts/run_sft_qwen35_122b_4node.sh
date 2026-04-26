@@ -20,10 +20,6 @@
 #   - Grads  bf16     same as params
 #   - Adam (m,v) fp32, ZeRO-1 → sharded across DP=4 → ~30 GB/GPU
 #   Per-GPU peak ≈ 70-78 GB on 80G GPUs — very tight.
-#   Mitigations active: full activation recompute + expandable_segments allocator.
-#   SEQ=1024 (halved from 2048) to give Triton autotuner bench headroom on first
-#   backward pass (Pitfall #22). Restore SEQ=2048 only after autotune completes
-#   and cache is warm, or after monkey-patching triton.autotune.
 #
 # Container assumptions: same as run_sft_qwen35_122b_2node_lora.sh (NGC 25.06).
 #
@@ -42,13 +38,37 @@ set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Repo + paths
+#
+# Required (no defaults — must be set by the caller):
+#   HF_MODEL    path to the Hugging Face model directory
+#   MCORE_PATH  path to the converted Megatron-Core checkpoint directory
+#
+# Optional (derived from REPO_ROOT / MEG_RUN_DIR if not set):
+#   REPO_ROOT   Megatron-Bridge repo root (auto-derived from this script's location)
+#   MEG_RUN_DIR working root for data / outputs / logs / hf_cache
+#               default: sibling of REPO_ROOT named "meg-run"
+#   TRAIN_DATA  training JSONL file
+#   OUTPUT_DIR  checkpoint save directory
+#   LOG_DIR     log directory
 # ---------------------------------------------------------------------------
-REPO_ROOT="${REPO_ROOT:-/mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge}"
-HF_MODEL="${HF_MODEL:-/mnt/tidal-alsh01/dataset/redone/checkpoints/opensource/Qwen3.5-122B-A10B}"
-MCORE_PATH="${MCORE_PATH:-/mnt/tidal-alsh01/dataset/redone/hade/data/Qwen3.5-122B-A10B-mcore}"
-TRAIN_DATA="${TRAIN_DATA:-/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/demo_data/train_data_demo.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/qwen35_122b_full_sft}"
-LOG_DIR="${LOG_DIR:-/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/logs}"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+MEG_RUN_DIR="${MEG_RUN_DIR:-$(dirname "$REPO_ROOT")/meg-run}"
+
+# Mandatory path variables — fail fast if not set
+if [[ -z "${HF_MODEL:-}" ]]; then
+    echo "[ERROR] HF_MODEL is not set. Export the path to your HF model directory." >&2
+    echo "  export HF_MODEL=/path/to/Qwen3.5-122B-A10B" >&2
+    exit 1
+fi
+if [[ -z "${MCORE_PATH:-}" ]]; then
+    echo "[ERROR] MCORE_PATH is not set. Export the path to your Megatron-Core checkpoint." >&2
+    echo "  export MCORE_PATH=/path/to/Qwen3.5-122B-A10B-mcore" >&2
+    exit 1
+fi
+
+TRAIN_DATA="${TRAIN_DATA:-${MEG_RUN_DIR}/demo_data/train_data_demo.jsonl}"
+OUTPUT_DIR="${OUTPUT_DIR:-${MEG_RUN_DIR}/qwen35_122b_full_sft}"
+LOG_DIR="${LOG_DIR:-${MEG_RUN_DIR}/logs}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/sft_full_4node_$(date +%Y%m%d_%H%M%S)_rank${RANK:-0}.log}"
 
 # ---------------------------------------------------------------------------
@@ -65,8 +85,6 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 # ---------------------------------------------------------------------------
 TP="${TP:-2}"
 PP="${PP:-4}"
-# EP must divide DP evenly. DP = world_size/(TP*PP) = 32/(2*4) = 4.
-# EP=8 > DP=4 is invalid (Megatron-Core asserts). Use EP=4.
 EP="${EP:-4}"
 
 # ---------------------------------------------------------------------------
@@ -125,14 +143,8 @@ export TORCH_NCCL_AVOID_RECORD_STREAMS="${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 # Do NOT set CUDA_LAUNCH_BLOCKING — it serializes all CUDA ops and breaks NCCL async.
 # Do NOT override NCCL_SOCKET_IFNAME here — the cluster injects bond1 correctly.
-# Pitfall #22: FLA Triton autotuner OOM during backward.
-# chunk_gated_delta_rule_bwd triggers triton autotuner benchmarking on the first
-# backward pass. Each candidate config allocates extra temp tensors while model
-# activations are still live, pushing peak VRAM well beyond 80G.
-# FLA_AUTOTUNE=0 skips benchmarking and uses the default config immediately.
-# Typical throughput penalty: 5-15% vs. fully tuned — acceptable for training.
 export FLA_AUTOTUNE="${FLA_AUTOTUNE:-0}"
-export HF_HOME="${HF_HOME:-/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/hf_cache}"
+export HF_HOME="${HF_HOME:-${MEG_RUN_DIR}/hf_cache}"
 mkdir -p "$HF_HOME"
 
 # ---------------------------------------------------------------------------
@@ -149,10 +161,15 @@ OVERRIDES=(
     model.pipeline_model_parallel_size="$PP"
     model.expert_model_parallel_size="$EP"
 
-    # Activation recompute (full uniform — required for 32 GPU on 122B)
+    # Activation recompute (full BLOCK — every layer of every PP stage is
+    # recomputed end-to-end, freeing all per-layer GDN bwd workspace as soon
+    # as the layer's bwd finishes). With PP=4 each stage has 12 layers.
+    # uniform+1 (the previous setting) only recomputed in chunks of 1 layer
+    # which still kept many layers' fwd activations alive at once during bwd
+    # — contributed to Pitfall #23 OOM at SEQ=1024.
     model.recompute_granularity=full
-    model.recompute_method=uniform
-    model.recompute_num_layers=1
+    model.recompute_method=block
+    model.recompute_num_layers=12
 
     # Disable MTP (Multi-Token Prediction) to relieve last-pipeline-stage memory.
     # MTP adds ~1 extra transformer block + LM-head overhead only on the last PP stage,
@@ -162,6 +179,25 @@ OVERRIDES=(
 
     # GDN constraint
     dataset.pack_sequences_in_batch=False
+
+    # Optimizer CPU offload (Pitfall #28, 2026-04-26).
+    # The 122B model on 32 GPU has baseline 48 GB / 80 GB, leaving 22 GB for
+    # activations + optimizer-state lazy alloc.  But Adam's exp_avg + exp_avg_sq
+    # buffers (~30 GB total fp32 unsharded, ~7.5 GB/GPU after DP=8 sharding)
+    # are LAZILY allocated inside fused_adam.initialize_state on the first
+    # optimizer.step().  Combined with iter-0 fwd/bwd transients
+    # (~21 GB peak), the alloc crosses 80 G and OOMs.
+    #
+    # Fix: move all Adam state to CPU.  HybridDeviceOptimizer keeps Adam
+    # math on CPU (slower step but compute is small fraction of total).
+    # Skill cpu-offloading: optimizer offload is the only option for PP > 1.
+    # PP=4 here, so activation offload is forbidden.
+    #
+    # Set OPTIM_OFFLOAD_FRAC=0 to disable; OPTIM_OFFLOAD_FRAC=1.0 for max savings.
+    optimizer.optimizer_cpu_offload="${OPTIM_OFFLOAD:-True}"
+    optimizer.optimizer_offload_fraction="${OPTIM_OFFLOAD_FRAC:-1.0}"
+    optimizer.overlap_cpu_optimizer_d2h_h2d="${OPTIM_OFFLOAD_OVERLAP:-True}"
+    optimizer.use_precision_aware_optimizer="${USE_PRECISION_AWARE_OPT:-True}"
 
     # Iters / batch
     train.train_iters="$ITERS"

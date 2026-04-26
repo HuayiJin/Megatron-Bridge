@@ -39,13 +39,37 @@ set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Repo + paths
+#
+# Required (no defaults — must be set by the caller):
+#   HF_MODEL    path to the Hugging Face model directory
+#   MCORE_PATH  path to the converted Megatron-Core checkpoint directory
+#
+# Optional (derived from REPO_ROOT / MEG_RUN_DIR if not set):
+#   REPO_ROOT   Megatron-Bridge repo root (auto-derived from this script's location)
+#   MEG_RUN_DIR working root for data / outputs / logs / hf_cache
+#               default: sibling of REPO_ROOT named "meg-run"
+#   TRAIN_DATA  training JSONL file
+#   OUTPUT_DIR  checkpoint save directory
+#   LOG_DIR     log directory
 # ---------------------------------------------------------------------------
-REPO_ROOT="${REPO_ROOT:-/mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge}"
-HF_MODEL="${HF_MODEL:-/mnt/tidal-alsh01/dataset/redone/checkpoints/opensource/Qwen3.5-122B-A10B}"
-MCORE_PATH="${MCORE_PATH:-/mnt/tidal-alsh01/dataset/redone/hade/data/Qwen3.5-122B-A10B-mcore}"
-TRAIN_DATA="${TRAIN_DATA:-/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/demo_data/train_demo.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/qwen35_122b_lora_demo}"
-LOG_DIR="${LOG_DIR:-/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/logs}"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+MEG_RUN_DIR="${MEG_RUN_DIR:-$(dirname "$REPO_ROOT")/meg-run}"
+
+# Mandatory path variables — fail fast if not set
+if [[ -z "${HF_MODEL:-}" ]]; then
+    echo "[ERROR] HF_MODEL is not set. Export the path to your HF model directory." >&2
+    echo "  export HF_MODEL=/path/to/Qwen3.5-122B-A10B" >&2
+    exit 1
+fi
+if [[ -z "${MCORE_PATH:-}" ]]; then
+    echo "[ERROR] MCORE_PATH is not set. Export the path to your Megatron-Core checkpoint." >&2
+    echo "  export MCORE_PATH=/path/to/Qwen3.5-122B-A10B-mcore" >&2
+    exit 1
+fi
+
+TRAIN_DATA="${TRAIN_DATA:-${MEG_RUN_DIR}/demo_data/train_demo.jsonl}"
+OUTPUT_DIR="${OUTPUT_DIR:-${MEG_RUN_DIR}/qwen35_122b_lora_demo}"
+LOG_DIR="${LOG_DIR:-${MEG_RUN_DIR}/logs}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/sft_lora_2node_$(date +%Y%m%d_%H%M%S)_rank${RANK:-0}.log}"
 
 # ---------------------------------------------------------------------------
@@ -128,7 +152,7 @@ export TORCH_NCCL_AVOID_RECORD_STREAMS="${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 
 # Make HF processor load faster on multinode by avoiding repeated downloads
-export HF_HOME="${HF_HOME:-/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/hf_cache}"
+export HF_HOME="${HF_HOME:-${MEG_RUN_DIR}/hf_cache}"
 mkdir -p "$HF_HOME"
 
 # ---------------------------------------------------------------------------
