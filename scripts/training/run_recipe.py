@@ -135,9 +135,20 @@ if os.environ.get("TRITON_DISABLE_AUTOTUNE_PATCH", "0") != "1":
     _real_autotune = _triton.autotune
 
     def _single_config_autotune(configs, key, **kwargs):
-        """Replace all autotune config lists with a single default config."""
-        single = [_triton.Config({}, num_warps=4, num_stages=2)]
-        # Drop cache_results / prune_configs_by to avoid version-compat issues
+        """Retain only the FIRST config from each @triton.autotune call.
+
+        Using a single config means Triton skips benchmarking entirely and
+        compiles + runs that one config immediately, consuming no extra VRAM.
+
+        IMPORTANT: we keep the original config object unchanged (including all
+        its kwargs like BLOCK_SIZE_N, BLOCK_SIZE_K, etc.).  Replacing it with
+        a blank Config({}) breaks kernels that read cfg.kwargs at module-load
+        time (e.g. mamba_ssm ssd_chunk_state.py computes a min() over
+        BLOCK_SIZE_N at import time → KeyError if kwargs is empty).
+
+        Drop triton-version-specific kwargs that don't exist in triton 3.3.0.
+        """
+        single = configs[:1]  # keep first original config, kwargs intact
         safe_kwargs = {
             k: v for k, v in kwargs.items() if k not in ("cache_results", "prune_configs_by", "warmup", "rep")
         }
