@@ -245,7 +245,9 @@ RUN ${VENV_DIR}/bin/pip install --no-cache-dir \
     && rm /tmp/requirements-prebaked.txt
 
 # Step B: nvidia-resiliency-ext from NVIDIA PyPI (separate resolver scope).
-RUN ${VENV_DIR}/bin/pip install --no-cache-dir \
+# --upgrade ensures the package is installed into the venv even if the NGC
+# base image already ships an older version in dist-packages.
+RUN ${VENV_DIR}/bin/pip install --no-cache-dir --upgrade \
         --extra-index-url https://pypi.nvidia.com \
         "nvidia-resiliency-ext"
 
@@ -273,31 +275,43 @@ RUN set -e; \
         || { echo "  FAIL  mamba_ssm patch missing"; exit 1; }; \
     echo "--- prebaked pure-Python deps (spot check) ---"; \
     echo "    (checking venv SP and NGC dist-packages; either location is OK)"; \
-    for f in \
-        transformers/__init__.py \
-        peft/__init__.py \
-        datasets/__init__.py \
-        accelerate/__init__.py \
-        diffusers/__init__.py \
-        einops/__init__.py \
-        omegaconf/__init__.py \
-        tensorboard/__init__.py \
-        wandb/__init__.py \
-        hydra/__init__.py \
-        timm/__init__.py \
-        mlflow/__init__.py \
-        nvidia_resiliency_ext/__init__.py \
-        pytest/__init__.py \
-        ruff/__main__.py \
-    ; do \
+    check_file() { \
+        local f="$1"; \
         if test -f "$SP/$f"; then \
             echo "  ok    $f  (venv)"; \
         elif test -f "$SP_NGC/$f"; then \
             echo "  ok    $f  (NGC)"; \
         else \
-            echo "  FAIL  $f"; exit 1; \
+            echo "  FAIL  $f"; return 1; \
         fi; \
-    done; \
+    }; \
+    check_dir() { \
+        local d="$1"; \
+        if test -d "$SP/$d"; then \
+            echo "  ok    $d/  (venv)"; \
+        elif test -d "$SP_NGC/$d"; then \
+            echo "  ok    $d/  (NGC)"; \
+        else \
+            echo "  FAIL  $d/"; return 1; \
+        fi; \
+    }; \
+    check_file transformers/__init__.py; \
+    check_file peft/__init__.py; \
+    check_file datasets/__init__.py; \
+    check_file accelerate/__init__.py; \
+    check_file diffusers/__init__.py; \
+    check_file einops/__init__.py; \
+    check_file omegaconf/__init__.py; \
+    check_file tensorboard/__init__.py; \
+    check_file wandb/__init__.py; \
+    check_file hydra/_internal/__init__.py; \
+    check_file timm/__init__.py; \
+    check_file mlflow/__init__.py; \
+    check_dir  nvidia_resiliency_ext/fault_tolerance; \
+    check_file pytest/__init__.py; \
+    test -x "${VENV_DIR}/bin/ruff" \
+        && echo "  ok    ruff  (venv bin)" \
+        || { echo "  FAIL  ruff not found in ${VENV_DIR}/bin/"; exit 1; }; \
     echo "=== sanity OK ==="
 
 # ------------------------------------------------------------------------------
