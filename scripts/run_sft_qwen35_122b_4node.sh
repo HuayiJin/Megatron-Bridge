@@ -200,12 +200,15 @@ Qwen3.5-122B-A10B FULL SFT (4-node)
 ============================================================
 EOF
 
+RDZV_TIMEOUT="${RDZV_TIMEOUT:-1800}"
+
 "$VENV_PY" -u -m torch.distributed.run \
     --nproc_per_node="$NPROC" \
     --nnodes="$NNODES" \
     --node_rank="$NODE_RANK" \
     --master_addr="$MASTER_ADDR" \
     --master_port="$MASTER_PORT" \
+    --rdzv_conf "timeout=${RDZV_TIMEOUT}" \
     scripts/training/run_recipe.py \
     "${OVERRIDES[@]}" \
     2>&1 | tee "$LOG_FILE"
