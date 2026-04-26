@@ -21,6 +21,9 @@
 #   - Adam (m,v) fp32, ZeRO-1 → sharded across DP=4 → ~30 GB/GPU
 #   Per-GPU peak ≈ 70-78 GB on 80G GPUs — very tight.
 #   Mitigations active: full activation recompute + expandable_segments allocator.
+#   SEQ=1024 (halved from 2048) to give Triton autotuner bench headroom on first
+#   backward pass (Pitfall #22). Restore SEQ=2048 only after autotune completes
+#   and cache is warm, or after monkey-patching triton.autotune.
 #
 # Container assumptions: same as run_sft_qwen35_122b_2node_lora.sh (NGC 25.06).
 #
@@ -71,7 +74,7 @@ EP="${EP:-4}"
 # ---------------------------------------------------------------------------
 RECIPE="${RECIPE:-qwen35_vl_122b_a10b_sft_config}"
 ITERS="${ITERS:-20}"
-SEQ="${SEQ:-2048}"
+SEQ="${SEQ:-1024}"
 GBS="${GBS:-32}"
 MBS="${MBS:-1}"
 LOG_INTERVAL="${LOG_INTERVAL:-1}"

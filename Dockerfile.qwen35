@@ -12,10 +12,11 @@
 #   - /opt/venv-mbridge: a venv that inherits NGC site-packages, plus:
 #       causal-conv1d 1.6.1 + mamba-ssm 2.3.1 (prebuilt wheels, ABI-patched)
 #       flash-linear-attention 0.4.2 + fla-core 0.4.2 (pure Python, network install)
-#       ALL stable pure-Python deps from docker/requirements-prebaked.txt:
+#       stable pure-Python deps from docker/requirements-prebaked.txt:
 #         transformers, peft, datasets, accelerate, diffusers, omegaconf,
 #         tensorboard, wandb, hydra-core, timm, open-clip-torch, mlflow,
-#         comet-ml, nvidia-resiliency-ext, pytest, ruff, mypy, pre-commit, …
+#         pytest, ruff, mypy, pre-commit, …
+#       nvidia-resiliency-ext (separate install from https://pypi.nvidia.com)
 #   - mamba_ssm/__init__.py ABI patch (makes import non-fatal on NGC torch 2.8a)
 #
 # Runtime `uv sync` only needs to install megatron-core + megatron-bridge (~1 min
@@ -212,34 +213,41 @@ except BaseException:
 PYEOF
 
 # ------------------------------------------------------------------------------
-# Pre-bake stable pure-Python dependencies (and nvidia-resiliency-ext) into
-# the venv at image build time.  This offloads the bulk of `uv sync` work from
-# every container launch to a one-time image build step.
+# Pre-bake stable pure-Python dependencies into the venv at image build time.
+# This offloads the bulk of `uv sync` work from every container launch to a
+# one-time image build step.
 #
 # Key design decisions (no-GPU build host safe):
 #   - pip install, NOT uv sync: avoids needing pyproject.toml / uv.lock in the
 #     image, so the image stays stable even as pyproject.toml evolves.
-#   - --no-deps is NOT used: we want transitive deps resolved by pip here.
-#   - Packages already in the NGC image (torch, TE, flash-attn, apex,
-#     causal-conv1d, mamba-ssm, flash-linear-attention, fla-core, nvidia-cuda-*)
-#     are absent from requirements-prebaked.txt; pip skips reinstalling them
-#     because they satisfy the version constraints.
-#   - nvidia-resiliency-ext comes from https://pypi.nvidia.com (NVIDIA PyPI).
+#   - TWO separate RUN steps to keep pip resolver scope small:
+#       Step A: core pure-Python deps (requirements-prebaked.txt, PyPI only).
+#       Step B: nvidia-resiliency-ext alone from https://pypi.nvidia.com.
+#     This avoids pip's "resolution-too-deep" error that occurs when nemo-run,
+#     comet-ml, and NVIDIA packages are resolved together in one pass.
+#   - Excluded from prebaked (installed at runtime by uv sync):
+#       nemo-run, comet-ml, pyarrow, sphinx/docs group — all have complex or
+#       very deep transitive dependency graphs.
 #   - megatron-core and megatron-bridge are intentionally absent — they require
 #     the /mnt NAS source tree and are installed at runtime by
 #     scripts/install_runtime_deps.sh.
 #   - Backward compatibility: install_runtime_deps.sh is unchanged in behavior.
 #     `uv sync` detects pre-installed packages via the venv's site-packages and
-#     skips re-downloading them, reducing runtime setup from ~10 min to ~1 min.
+#     skips re-downloading them, reducing runtime setup from ~10 min to ~1-2 min.
 #
 # To update: edit docker/requirements-prebaked.txt and rebuild the image.
 # ------------------------------------------------------------------------------
 COPY docker/requirements-prebaked.txt /tmp/requirements-prebaked.txt
 
+# Step A: core pure-Python deps from PyPI.
 RUN ${VENV_DIR}/bin/pip install --no-cache-dir \
-        --extra-index-url https://pypi.nvidia.com \
         -r /tmp/requirements-prebaked.txt \
     && rm /tmp/requirements-prebaked.txt
+
+# Step B: nvidia-resiliency-ext from NVIDIA PyPI (separate resolver scope).
+RUN ${VENV_DIR}/bin/pip install --no-cache-dir \
+        --extra-index-url https://pypi.nvidia.com \
+        "nvidia-resiliency-ext"
 
 # ------------------------------------------------------------------------------
 # Build-time sanity — pure shell, no Python imports (no GPU on build host).

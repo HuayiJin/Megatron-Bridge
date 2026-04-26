@@ -18,6 +18,13 @@
 #    detects that these packages are already installed and skips them, making
 #    the runtime step only need to install megatron-core + megatron-bridge.
 #
+# Intentionally excluded (to keep pip resolver complexity manageable):
+#   - nemo-run          : optional extra [recipes], very deep dep graph
+#   - comet-ml          : optional experiment tracker, complex transitive deps
+#   - pyarrow           : optional extra [parquet], large binary wheel
+#   - docs group        : sphinx / myst-parser etc., not needed at training time
+#   These are installed at runtime by `uv sync --all-extras --all-groups`.
+#
 # Maintenance
 # -----------
 # When pyproject.toml gains new pure-Python dependencies, add them here and
@@ -25,8 +32,9 @@
 # it here too. No image rebuild is needed for megatron-core or megatron-bridge
 # changes — those are always installed at runtime from /mnt.
 #
-# nvidia-resiliency-ext is installed from the NVIDIA PyPI index; the Dockerfile
-# passes --extra-index-url https://pypi.nvidia.com when invoking pip here.
+# nvidia-resiliency-ext is installed separately in the Dockerfile (its own
+# RUN step with --extra-index-url https://pypi.nvidia.com) to keep resolver
+# scope small and avoid pip's "resolution-too-deep" error.
 
 # ==============================================================================
 # Core training dependencies  (mirrors [project.dependencies] in pyproject.toml)
@@ -54,7 +62,6 @@ rich
 tqdm>=4.67.1
 wandb>=0.25.0
 mlflow>=3.9.0          # CVE-2025-15031
-comet-ml>=3.50.0
 
 # Typing / compat
 typing-extensions
@@ -65,9 +72,6 @@ timm
 open-clip-torch>=3.2.0
 qwen-vl-utils
 
-# NVIDIA resiliency (from https://pypi.nvidia.com — needs --extra-index-url)
-nvidia-resiliency-ext
-
 # ==============================================================================
 # CVE security overrides  (mirrors [tool.uv.override-dependencies])
 # ==============================================================================
@@ -76,13 +80,8 @@ cachetools>=5.0.0
 cryptography>=43.0.0,<47
 
 # ==============================================================================
-# Optional extras worth pre-baking (parquet, recipes)
-# ==============================================================================
-pyarrow>=14.0.0
-nemo-run
-
-# ==============================================================================
-# Test / dev / docs groups  (mirrors [dependency-groups] in pyproject.toml)
+# Test / dev groups  (mirrors [dependency-groups] in pyproject.toml)
+# Docs group excluded — not needed at training time.
 # ==============================================================================
 
 # test
@@ -100,12 +99,3 @@ pylint>=3.3.7
 pre-commit>=3.6.0
 ruff>=0.9.9
 mypy>=1.8.0
-
-# docs
-myst-parser>=4.0.1
-sphinx>=8.1.3
-sphinx-autobuild>=2024.10.3
-sphinx-autodoc2>=0.5.0
-sphinx-copybutton>=0.5.2
-sphinxcontrib-mermaid
-nvidia-sphinx-theme>=0.0.8
