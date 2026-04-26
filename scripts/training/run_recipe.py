@@ -105,7 +105,49 @@ Recipe Arguments:
 
 import argparse
 import inspect
+import os
 from typing import Callable
+
+# ---------------------------------------------------------------------------
+# Pitfall #22 — FLA Triton autotuner OOM on first backward pass.
+#
+# triton.autotune benchmarks ALL candidate configs before selecting the best
+# one.  During the very first backward pass the model's activation tensors are
+# still live, so the extra benchmark buffers push peak VRAM beyond 80 GB on
+# L20Y GPUs (TP=2 PP=4 EP=4, 122B model).
+#
+# Root cause: triton 3.3.0 does NOT support the `cache_results` parameter
+# (added in triton ≥ 3.4.0), so FLA's FLA_CACHE_RESULTS / FLA_AUTOTUNE env
+# vars have no effect.
+#
+# Fix: monkey-patch triton.autotune HERE — before any `import fla` or
+# `import megatron.bridge` can trigger the decorated kernels — so that every
+# @triton.autotune call receives exactly ONE config (num_warps=4, num_stages=2).
+# With a single config there is nothing to benchmark; Triton compiles and runs
+# it immediately, consuming no extra VRAM.
+#
+# To restore full autotuning (e.g. after upgrading to triton ≥ 3.4.0 which
+# supports cache_results), set env var TRITON_DISABLE_AUTOTUNE_PATCH=1.
+# ---------------------------------------------------------------------------
+if os.environ.get("TRITON_DISABLE_AUTOTUNE_PATCH", "0") != "1":
+    import triton as _triton
+
+    _real_autotune = _triton.autotune
+
+    def _single_config_autotune(configs, key, **kwargs):
+        """Replace all autotune config lists with a single default config."""
+        single = [_triton.Config({}, num_warps=4, num_stages=2)]
+        # Drop cache_results / prune_configs_by to avoid version-compat issues
+        safe_kwargs = {
+            k: v for k, v in kwargs.items() if k not in ("cache_results", "prune_configs_by", "warmup", "rep")
+        }
+        return _real_autotune(configs=single, key=key, **safe_kwargs)
+
+    _triton.autotune = _single_config_autotune
+    # Also patch the module-level name used by `from triton import autotune`
+    import triton.runtime.autotuner as _autotuner  # noqa: E402
+
+    _autotuner.autotune = _single_config_autotune
 
 # TE 2.4 compatibility: `import transformer_engine as te` does NOT
 # automatically expose te.pytorch.distributed as an attribute chain.

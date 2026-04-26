@@ -74,7 +74,7 @@
 | Demo train JSONL | `/mnt/tidal-alsh01/dataset/redone/hade/dd/train_data_demo.jsonl` | 14 records, multi-turn text-only chat |
 | Cooked demo JSONL (text + 2 image samples) | `/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/demo_data/train_demo.jsonl` | 16 records |
 | Output / runs / logs root | `/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/` | per-run subdirs |
-| Megatron-Bridge source | `/mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge` | on NAS; run directly from here |
+| Megatron-Bridge source | any path — set `REPO_ROOT` env var, or `cd` into the repo and scripts auto-detect via `BASH_SOURCE` | clone to any directory |
 
 ## Container & Toolchain
 
@@ -117,52 +117,69 @@ Wheels are NOT git-tracked (~780 MB). Build fails fast if they are missing.
 
 ### Per-node startup sequence (every container launch)
 
+`REPO_ROOT` is the directory where you cloned Megatron-Bridge. All scripts
+auto-detect it from their own location (`BASH_SOURCE`), so you never need to
+hard-code a path — just `cd` into the repo before running anything.
+
 ```bash
-# Step 1 — start container, mount the NAS
+# Step 1 — start container, mount the NAS (adjust -v mount to your site)
 docker run --rm -it --gpus all --shm-size=64g --ulimit memlock=-1 \
   --network host \
-  -v /mnt/tidal-alsh01:/mnt/tidal-alsh01 \
+  -v /your/nas/mount:/your/nas/mount \
   qwen35-mbridge:cu129 bash
 
-# Step 2 — inside container: install megatron-core + megatron-bridge (~1 min, idempotent)
-cd /mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge
+# Step 2 — inside container: cd into wherever you cloned the repo, then setup
+cd /path/to/Megatron-Bridge          # ← the only path you need to know
 bash scripts/install_runtime_deps.sh
 # This script does:
 #   1. git submodule update --init (if 3rdparty/Megatron-LM is empty)
 #   2. uv sync  — installs megatron-core (editable) + all pyproject.toml deps
-#   3. uv pip install -e .  — installs megatron-bridge pointing at /mnt
+#   3. uv pip install -e .  — installs megatron-bridge pointing at the repo
 #   4. verifies mamba_ssm / causal_conv1d / fla (already in image, fast check)
-#   5. prints megatron.bridge.__file__ → must show /mnt path, not /opt
+#   5. prints megatron.bridge.__file__ → must show the repo path, not /opt
 
-# Step 3 — launch training on each node
-RANK=<0|1> MASTER_PORT=23456 bash /mnt/tidal-alsh01/dataset/redone/hade/dd/start.sh
+# Step 3 — set data/model paths (site-specific), then launch on each node
+export HF_MODEL=/path/to/Qwen3.5-122B-A10B
+export MCORE_PATH=/path/to/Qwen3.5-122B-A10B-mcore
+export TRAIN_DATA=/path/to/train.jsonl
+export OUTPUT_DIR=/path/to/output
+bash run/start_4node.sh              # for 4-node full SFT
+# bash run/start.sh                 # for 2-node LoRA SFT
 ```
 
 ### Quick reference
 
+All commands below assume you have already `cd /path/to/Megatron-Bridge`.
+
 | Action | Command |
 |--------|---------|
 | Interpreter | `/opt/venv-mbridge/bin/python` |
-| Runtime setup (once per container) | `cd /mnt/.../Megatron-Bridge && bash scripts/install_runtime_deps.sh` |
-| 2-node × 8-GPU LoRA SFT | `RANK=<0\|1> MASTER_PORT=23456 bash /mnt/tidal-alsh01/dataset/redone/hade/dd/start.sh` |
-| 4-node × 8-GPU full SFT | `RANK=<0\|1\|2\|3> MASTER_PORT=23456 bash /mnt/tidal-alsh01/dataset/redone/hade/dd/start_4node.sh` |
+| Runtime setup (once per container) | `cd <repo> && bash scripts/install_runtime_deps.sh` |
+| 2-node × 8-GPU LoRA SFT | `bash run/start.sh` |
+| 4-node × 8-GPU full SFT | `bash run/start_4node.sh` |
 | Underlying SFT scripts | `scripts/run_sft_qwen35_122b_2node_lora.sh` / `scripts/run_sft_qwen35_122b_4node.sh` |
-| Verify mcore ckpt (no GPU needed) | `/opt/venv-mbridge/bin/python scripts/verify_mcore_ckpt.py /mnt/tidal-alsh01/dataset/redone/hade/data/Qwen3.5-122B-A10B-mcore` |
+| Verify mcore ckpt (no GPU needed) | `/opt/venv-mbridge/bin/python scripts/verify_mcore_ckpt.py $MCORE_PATH` |
 | Operator runbook | `docs/qwen35_122b_sft_runbook.md` |
 
 ### Manual multi-node launch — canonical recipe
 
 ```bash
 # On EACH node, inside the container, after install_runtime_deps.sh:
-cd /mnt/tidal-alsh01/dataset/redone/hade/dd
+cd /path/to/Megatron-Bridge
+
+# Export site-specific paths (only needed if not injected by scheduler)
+export HF_MODEL=/path/to/Qwen3.5-122B-A10B
+export MCORE_PATH=/path/to/Qwen3.5-122B-A10B-mcore
+export TRAIN_DATA=/path/to/train.jsonl
+export OUTPUT_DIR=/path/to/output
 
 # Node 0 (master):
 tmux new -s sft -d
-tmux send-keys -t sft "RANK=0 MASTER_PORT=23456 bash start.sh" C-m
+tmux send-keys -t sft "RANK=0 MASTER_PORT=23456 bash run/start_4node.sh" C-m
 
-# Node 1 (worker):
+# Node 1-3 (workers):
 tmux new -s sft -d
-tmux send-keys -t sft "RANK=1 MASTER_PORT=23456 bash start.sh" C-m
+tmux send-keys -t sft "RANK=<1|2|3> MASTER_PORT=23456 bash run/start_4node.sh" C-m
 ```
 
 **Always pass `MASTER_PORT=23456` explicitly** — the master's container
@@ -228,7 +245,7 @@ left alone.
 | 19 | Last PP stage OOM while ranks 0-2 are fine (MTP layer imbalance) | `mtp_num_hidden_layers=1` adds one extra transformer block + LM head to the **last pipeline stage only**. On tight 80G GPUs this creates ~6-8 GB extra pressure on rank(PP-1) vs other stages. Symptom: OOM during optimizer-state initialization on last-stage ranks while all other ranks pass. **Fix (2026-04-26):** Set `model.mtp_num_layers=0` in overrides to disable MTP for SFT. See §MTP Memory Note for cost of re-enabling. |
 | 20 | `FileNotFoundError: triton_poi_fused_mul_silu_1.json` on rank N during Triton JIT compilation | Root cause: `TRITON_CACHE_DIR` was pointed at a NAS path (`/mnt/...`). 32 ranks concurrently write to the same NFS directory; NFS cache-coherency delay means a rank can see the directory entry before the `.json` metadata file is visible → `FileNotFoundError`. Setting a shared NFS path for Triton cache is wrong: each rank compiles independently and caches locally by default; cross-rank sharing has no benefit and introduces NFS race conditions. **Fix (2026-04-26):** Remove `TRITON_CACHE_DIR` from `run_sft_qwen35_122b_4node.sh`; let each rank use its default local cache (`~/.triton/cache`). Do NOT set `TRITON_CACHE_DIR` to any NFS/NAS path in multi-process training. |
 | 21 | `ModuleNotFoundError: No module named 'transformer_engine'` spam from `te_distributed_compat.pth` on every container restart | Root cause: `install_runtime_deps.sh` (old step 4b) wrote `import transformer_engine.pytorch.distributed` into a venv `.pth` file. Python's `site` module processes venv `.pth` files immediately after adding that directory to `sys.path` — before `/usr/local/lib/python3.12/dist-packages` (NGC's TE location) is added. So the import always fails at `.pth` execution time. Non-fatal but causes log noise and signals broken setup; next container restart repeats the error. **Fix (2026-04-26):** (1) `install_runtime_deps.sh` step 4b now **removes** any stale `.pth` instead of creating one. (2) `scripts/training/run_recipe.py` does the import explicitly at process startup, after `sys.path` is complete. **Rule:** never use `.pth` files in venv site-packages to import packages that live in NGC system site-packages. |
-| 22 | `RuntimeError: Triton Error [CUDA]: out of memory` in `chunk_gated_delta_rule_bwd` during first backward pass | Root cause: Triton autotuner in `fla` (flash-linear-attention) `chunk_bwd_kernel_dqkwg` benchmarks all candidate configs on the **first** backward pass. Each benchmark run allocates extra temp tensors while model activations are still live (activation recompute has not freed them yet at autotuner invocation time). On 122B with TP=2 PP=4 EP=4 GBS=32 SEQ=2048 on 80G GPUs, the combined peak of activations + autotuner buffers exceeds 80G. All 8 ranks on the node OOM simultaneously. **Fix (2026-04-26):** Set `FLA_AUTOTUNE=0` in `run_sft_qwen35_122b_4node.sh`. This skips benchmarking and uses the default kernel config immediately. Throughput penalty: ~5–15% vs. a fully-tuned config — acceptable for SFT training. **Rule:** always set `FLA_AUTOTUNE=0` in multi-node training with tight VRAM budgets; let autotuning run only on isolated single-GPU profiling runs. |
+| 22 | `RuntimeError: Triton Error [CUDA]: out of memory` in `chunk_gated_delta_rule_bwd` during first backward pass | Root cause: Triton autotuner (176 `@triton.autotune` decorators in FLA) benchmarks ALL candidate configs on the first backward pass. Each bench run allocates extra temp tensors while activations are still live → peak VRAM exceeds 80G. Affects all 8 GPUs simultaneously. **Why `FLA_AUTOTUNE=0` / `FLA_CACHE_RESULTS=0` don't work:** triton 3.3.0 does not support the `cache_results` parameter (added in triton ≥ 3.4.0); `autotune_cache_kwargs` is empty, so those env vars have no effect. **Why `SEQ=1024` is insufficient:** activations scale with seq but optimizer states + params do not; 80G headroom is still too small for 9 bench configs × extra buffers on 122B model. **Fix (2026-04-26):** Monkey-patch `triton.autotune` at the top of `scripts/training/run_recipe.py` **before any `import fla`**, replacing every kernel's config list with a single `Config(num_warps=4, num_stages=2)`. With 1 config there is nothing to benchmark; Triton compiles and runs it immediately, no extra VRAM. Disable patch by setting `TRITON_DISABLE_AUTOTUNE_PATCH=1`. FLA uses `import triton; @triton.autotune` (not `from triton import autotune`), so patching `triton.autotune` intercepts all 176 decorators. Throughput penalty: 5–15% vs fully-tuned — acceptable for SFT. |
 
 ## MTP Memory Note (for future re-enablement)
 
@@ -321,7 +338,7 @@ Fresh containers have all three deps + patch ready immediately.
 | B. HF → mcore conversion | ✅ Done (pre-existing, 234 GB) | `/mnt/tidal-alsh01/dataset/redone/hade/data/Qwen3.5-122B-A10B-mcore` |
 | C. Pure-env image + /mnt runtime | ✅ Done (2026-04-25) | `Dockerfile.qwen35`, `scripts/install_runtime_deps.sh` |
 | D. 2-node × 8-GPU LoRA SFT demo | ⏳ Deferred (user prefers full SFT) | `scripts/run_sft_qwen35_122b_2node_lora.sh` via `start.sh` |
-| E. 4-node × 8-GPU full SFT | 🟡 In progress — OOM resolved (EP=4, MTP=0, SEQ=2048, expandable_segments, FLA_AUTOTUNE=0); TRITON_CACHE_DIR NAS race fixed | `scripts/run_sft_qwen35_122b_4node.sh` |
+| E. 4-node × 8-GPU full SFT | 🟡 In progress — triton.autotune monkey-patch applied; SEQ=1024; EP=4; MTP=0; expandable_segments | `scripts/run_sft_qwen35_122b_4node.sh` |
 | F. Real internal multimodal data | ⏳ Pending — no real images yet | needs spec |
 
 ## Open Questions (pending user)
@@ -337,4 +354,4 @@ Older bare-metal venv setup (cu128 + TE 2.7 + flash-attn 2.8.1, single-node
 H20-141G, `/data/temp/...` paths), old Dockerfile iteration history (with
 `COPY` + editable install baked in), conversion debugging — see `memory_legacy.md`.
 
-_Last updated: 2026-04-26 (Pitfall #16 uv sync --inexact; Pitfall #17 EP>DP invalid on 32GPU; Pitfall #18 install_runtime_deps on all nodes; Pitfall #19 MTP last-stage OOM; Pitfall #20 TRITON_CACHE_DIR NAS race → FileNotFoundError; Pitfall #21 te_distributed_compat.pth venv sys.path ordering → ModuleNotFoundError; Pitfall #22 FLA Triton autotuner OOM in chunk_gated_delta_rule_bwd → FLA_AUTOTUNE=0; MTP memory note added; Standard Recipes EP corrected to EP=4; Stage D deferred, Stage E in progress)_
+_Last updated: 2026-04-26 (Pitfall #16–21 various; Pitfall #22 FLA Triton autotuner OOM → triton.autotune monkey-patch in run_recipe.py + SEQ=1024; startup sequence updated to be repo-location-agnostic — set HF_MODEL/MCORE_PATH/TRAIN_DATA/OUTPUT_DIR, cd into repo, run scripts; Stage E in progress)_
