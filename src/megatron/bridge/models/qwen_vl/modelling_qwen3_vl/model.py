@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Optional
 
 import torch
@@ -50,6 +51,27 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
     split_deepstack_embs,
 )
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.vision_model import Qwen3VLVisionModel
+
+
+logger = logging.getLogger(__name__)
+
+
+def _shape_or_none(value: torch.Tensor | None) -> tuple[int, ...] | None:
+    if isinstance(value, torch.Tensor):
+        return tuple(value.shape)
+    return None
+
+
+def _distributed_rank_or_none() -> int | None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return None
+
+
+def _count_token_id(tokens: torch.Tensor | None, token_id: int | None) -> int | None:
+    if tokens is None or token_id is None:
+        return None
+    return int((tokens == token_id).sum().item())
 
 
 class Qwen3VLModel(MegatronModule):
@@ -497,6 +519,38 @@ class Qwen3VLModel(MegatronModule):
 
             if vision_embeds is not None:
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+                vision_mask_tokens = int(vision_mask.sum().item()) if vision_mask is not None else None
+                vision_embeds_tokens = int(vision_embeds.shape[0])
+                if vision_mask_tokens != vision_embeds_tokens:
+                    logger.error(
+                        "Qwen3VL vision embedding insert mismatch: rank=%s image_token_id=%s "
+                        "video_token_id=%s input_image_tokens=%s input_video_tokens=%s "
+                        "vision_mask_tokens=%s vision_embeds_tokens=%s input_ids_shape=%s "
+                        "vision_mask_shape=%s vision_embeds_shape=%s combined_embeddings_shape=%s",
+                        _distributed_rank_or_none(),
+                        self.image_token_id,
+                        self.video_token_id,
+                        _count_token_id(input_ids, self.image_token_id),
+                        _count_token_id(input_ids, self.video_token_id),
+                        vision_mask_tokens,
+                        vision_embeds_tokens,
+                        _shape_or_none(input_ids),
+                        _shape_or_none(vision_mask),
+                        _shape_or_none(vision_embeds),
+                        _shape_or_none(combined_embeddings),
+                    )
+                elif logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Qwen3VL vision embedding insert check: rank=%s "
+                        "vision_mask_tokens=%s vision_embeds_tokens=%s "
+                        "vision_mask_shape=%s vision_embeds_shape=%s combined_embeddings_shape=%s",
+                        _distributed_rank_or_none(),
+                        vision_mask_tokens,
+                        vision_embeds_tokens,
+                        _shape_or_none(vision_mask),
+                        _shape_or_none(vision_embeds),
+                        _shape_or_none(combined_embeddings),
+                    )
                 combined_embeddings[vision_mask] = vision_embeds
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 

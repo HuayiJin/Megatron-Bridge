@@ -39,6 +39,34 @@ from megatron.bridge.training.utils.pg_utils import get_pg_collection
 logger = logging.getLogger(__name__)
 
 
+def _shape_or_none(value: Any) -> tuple[int, ...] | None:
+    if isinstance(value, torch.Tensor):
+        return tuple(value.shape)
+    return None
+
+
+def _log_forward_visual_args(source: str, forward_args: dict[str, Any]) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    logger.debug(
+        "VLM forward visual-args check: "
+        "source=%s has_pixel_values=%s pixel_values_shape=%s "
+        "has_image_grid_thw=%s image_grid_thw_shape=%s "
+        "has_pixel_values_videos=%s pixel_values_videos_shape=%s "
+        "has_video_grid_thw=%s video_grid_thw_shape=%s",
+        source,
+        "pixel_values" in forward_args,
+        _shape_or_none(forward_args.get("pixel_values")),
+        "image_grid_thw" in forward_args,
+        _shape_or_none(forward_args.get("image_grid_thw")),
+        "pixel_values_videos" in forward_args,
+        _shape_or_none(forward_args.get("pixel_values_videos")),
+        "video_grid_thw" in forward_args,
+        _shape_or_none(forward_args.get("video_grid_thw")),
+    )
+
+
 def get_batch_from_iterator(
     data_iterator: Iterable,
     use_mtp: bool = False,
@@ -439,7 +467,9 @@ def forward_step(
     }
 
     if visual_inputs is not None:
-        forward_args.update(visual_inputs.normalized_for_model())
+        multi_modal_inputs = visual_inputs.normalized_for_model()
+        forward_args.update(multi_modal_inputs)
+    _log_forward_visual_args("vlm_step", forward_args)
 
     # Add packed sequence support
     if cu_seqlens is not None:

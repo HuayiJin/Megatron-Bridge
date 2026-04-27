@@ -16,6 +16,9 @@
 Collation utilities for building VLM training batches from conversation examples.
 """
 
+import json
+import logging
+import re
 import warnings
 from typing import Any
 
@@ -34,6 +37,8 @@ MISSING_QWEN_VL_UTILS_MSG = (
     " provide compatible vision preprocessing."
 )
 
+logger = logging.getLogger(__name__)
+
 try:
     from qwen_vl_utils import process_vision_info
 
@@ -42,16 +47,51 @@ except ImportError:
     HAVE_QWEN_VL_UTILS = False
 
 
-def _gather_assistant_text_segments(example: dict) -> list[str]:
-    """Extract assistant text segments from the structured conversation example.
+def _shape_or_none(value: Any) -> tuple[int, ...] | None:
+    if isinstance(value, torch.Tensor):
+        return tuple(value.shape)
+    return None
+
+
+def _log_visual_inputs_debug(source: str, visual_inputs: Any) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    pixel_values = getattr(visual_inputs, "pixel_values", None) if visual_inputs is not None else None
+    image_grid_thw = getattr(visual_inputs, "image_grid_thw", None) if visual_inputs is not None else None
+    pixel_values_videos = getattr(visual_inputs, "pixel_values_videos", None) if visual_inputs is not None else None
+    video_grid_thw = getattr(visual_inputs, "video_grid_thw", None) if visual_inputs is not None else None
+
+    logger.debug(
+        "VLM visual-input check: "
+        "source=%s visual_inputs=%s pixel_values_shape=%s image_grid_thw_shape=%s "
+        "pixel_values_videos_shape=%s video_grid_thw_shape=%s",
+        source,
+        visual_inputs is not None,
+        _shape_or_none(pixel_values),
+        _shape_or_none(image_grid_thw),
+        _shape_or_none(pixel_values_videos),
+        _shape_or_none(video_grid_thw),
+    )
+
+
+def _apply_chat_template_for_example(processor: Any, example: dict, **kwargs) -> str:
+    tools = example.get("tools")
+    if tools:
+        kwargs["tools"] = tools
+    return processor.apply_chat_template(example["conversation"], **kwargs)
+
+
+def _gather_text_segments_by_role(example: dict, role: str) -> list[str]:
+    """Extract text segments for a role from the structured conversation example.
 
     The example schema is expected to be {"conversation": [{"role": ..., "content": [...]} ...]} where
     content is a list of items like {"type": "text"|"image"|..., "text": "..."}.
-    Returns a list of concatenated text strings, one per assistant turn.
+    Returns a list of concatenated text strings, one per matched turn.
     """
     texts: list[str] = []
     for turn in example.get("conversation", []):
-        if turn.get("role") != "assistant":
+        if turn.get("role") != role:
             continue
         parts = turn.get("content", [])
         buf = []
@@ -64,6 +104,161 @@ def _gather_assistant_text_segments(example: dict) -> list[str]:
         if buf:
             texts.append("".join(buf))
     return texts
+
+
+def _json_loads_if_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _tool_call_text_candidates(tool_call: dict) -> list[str]:
+    function = tool_call.get("function", {})
+    if not isinstance(function, dict):
+        return []
+    name = function.get("name")
+    if not name:
+        return []
+    arguments = _json_loads_if_string(function.get("arguments", {}))
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    payload = json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False)
+    qwen35_payload = _qwen35_tool_call_text(name, arguments)
+    candidates = [
+        qwen35_payload,
+        "<tool_call>\n" + payload + "\n</tool_call>",
+        payload,
+    ]
+    if isinstance(function.get("arguments"), str):
+        candidates.append(function["arguments"])
+    return candidates
+
+
+def _qwen35_tool_call_text(name: str, arguments: dict[str, Any]) -> str:
+    parts = [f"<tool_call>\n<function={name}>\n"]
+    for args_name, args_value in arguments.items():
+        if isinstance(args_value, (dict, list)):
+            args_text = json.dumps(args_value, ensure_ascii=False)
+        else:
+            args_text = str(args_value)
+        parts.append(f"<parameter={args_name}>\n{args_text}\n</parameter>\n")
+    parts.append("</function>\n</tool_call>")
+    return "".join(parts)
+
+
+def _gather_assistant_text_segments(example: dict) -> list[str]:
+    """Extract assistant text segments from the structured conversation example."""
+    texts: list[str] = []
+    for turn in example.get("conversation", []):
+        if turn.get("role") != "assistant":
+            continue
+        texts.extend(_gather_text_segments_by_role({"conversation": [turn]}, "assistant"))
+        for tool_call in turn.get("tool_calls", []):
+            if isinstance(tool_call, dict):
+                texts.extend(_tool_call_text_candidates(tool_call))
+    return texts
+
+
+def _gather_tagged_text_segments(example: dict, *, role: str, tag: str) -> list[str]:
+    """Extract complete XML-like tagged spans from text turns for debug checks."""
+    pattern = re.compile(rf"<{tag}>.*?</{tag}>", re.DOTALL)
+    spans: list[str] = []
+    for text in _gather_text_segments_by_role(example, role):
+        spans.extend(match.group(0) for match in pattern.finditer(text))
+    return spans
+
+
+def _token_ids_for_text(tokenizer: Any, text: str) -> list[int]:
+    token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    if hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+    if token_ids and isinstance(token_ids[0], list):
+        token_ids = token_ids[0]
+    return token_ids
+
+
+def _find_token_span_positions(ids: list[int], tokenizer: Any, span_text: str, start_from: int) -> list[int]:
+    variants = [span_text, span_text + "\n", span_text.strip(), span_text.strip() + "\n"]
+    for text in variants:
+        span_tokens = _token_ids_for_text(tokenizer, text)
+        if not span_tokens:
+            continue
+        for i in range(start_from, len(ids) - len(span_tokens) + 1):
+            if ids[i : i + len(span_tokens)] == span_tokens:
+                return list(range(i, i + len(span_tokens)))
+    return []
+
+
+def _gather_tool_call_candidate_groups(example: dict) -> list[list[str]]:
+    candidate_groups = [[span] for span in _gather_tagged_text_segments(example, role="assistant", tag="tool_call")]
+    for turn in example.get("conversation", []):
+        if turn.get("role") != "assistant":
+            continue
+        for tool_call in turn.get("tool_calls", []):
+            if isinstance(tool_call, dict):
+                candidates = _tool_call_text_candidates(tool_call)
+                if candidates:
+                    candidate_groups.append(candidates)
+    return candidate_groups
+
+
+def _count_unmasked_tokens_for_candidate_groups(
+    candidate_groups: list[list[str]],
+    ids: list[int],
+    mask: list[int],
+    tokenizer: Any,
+) -> tuple[int, int, int]:
+    total_tokens = 0
+    unmasked_tokens = 0
+    missing_spans = 0
+    for candidates in candidate_groups:
+        matched_positions = []
+        for span in candidates:
+            matched_positions = _find_token_span_positions(ids, tokenizer, span, 0)
+            if matched_positions:
+                break
+        if not matched_positions:
+            missing_spans += 1
+            continue
+        total_tokens += len(matched_positions)
+        unmasked_tokens += sum(mask[position] for position in matched_positions)
+    return total_tokens, unmasked_tokens, missing_spans
+
+
+def _log_tool_loss_mask_debug(example: dict, ids: list[int], mask: list[int], tokenizer: Any) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    tool_call_candidate_groups = _gather_tool_call_candidate_groups(example)
+    tool_response_spans = _gather_tagged_text_segments(example, role="user", tag="tool_response")
+    if not tool_call_candidate_groups and not tool_response_spans:
+        return
+
+    tool_call_tokens, tool_call_unmasked_tokens, missing_tool_call_spans = (
+        _count_unmasked_tokens_for_candidate_groups(tool_call_candidate_groups, ids, mask, tokenizer)
+    )
+    tool_response_tokens, tool_response_unmasked_tokens, missing_tool_response_spans = (
+        _count_unmasked_tokens_for_candidate_groups([[span] for span in tool_response_spans], ids, mask, tokenizer)
+    )
+
+    logger.debug(
+        "VLM tool loss-mask check: "
+        "tool_call_spans=%d missing_tool_call_spans=%d tool_call_unmasked_tokens=%d/%d "
+        "tool_response_spans=%d missing_tool_response_spans=%d tool_response_unmasked_tokens=%d/%d",
+        len(tool_call_candidate_groups),
+        missing_tool_call_spans,
+        tool_call_unmasked_tokens,
+        tool_call_tokens,
+        len(tool_response_spans),
+        missing_tool_response_spans,
+        tool_response_unmasked_tokens,
+        tool_response_tokens,
+    )
 
 
 def create_multiturn_loss_mask_by_search(
@@ -82,17 +277,11 @@ def create_multiturn_loss_mask_by_search(
 
     def try_mark(span_text: str, start_from: int) -> int:
         """Tokenize a span and mark its occurrence if found. Returns new search start index."""
-        variants = [span_text, span_text + "\n", span_text.strip(), span_text.strip() + "\n"]
-        for text in variants:
-            span_tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
-            if not span_tokens:
-                continue
-            # naive sequential search from start_from
-            for i in range(start_from, len(ids) - len(span_tokens) + 1):
-                if ids[i : i + len(span_tokens)] == span_tokens:
-                    for j in range(i, i + len(span_tokens)):
-                        mask[j] = 1
-                    return i + len(span_tokens)
+        positions = _find_token_span_positions(ids, tokenizer, span_text, start_from)
+        if positions:
+            for position in positions:
+                mask[position] = 1
+            return positions[-1] + 1
         return start_from
 
     search_start = 0
@@ -109,6 +298,8 @@ def create_multiturn_loss_mask_by_search(
     for k, t in enumerate(ids_t):
         if t in skipped_tokens:
             mask[k] = 0
+
+    _log_tool_loss_mask_debug(example, ids, mask, tokenizer)
     return mask
 
 
@@ -162,7 +353,7 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
 
     skipped_tokens = extract_skipped_token_ids(processor)
 
-    texts = [processor.apply_chat_template(example["conversation"], tokenize=False) for example in examples]
+    texts = [_apply_chat_template_for_example(processor, example, tokenize=False) for example in examples]
     # Build per-example images (list) and split by presence
     per_example_images = []
     has_images = []
@@ -275,6 +466,7 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     if "image_grid_thw" in batch:
         del batch["image_grid_thw"]
     batch["visual_inputs"] = visual_inputs
+    _log_visual_inputs_debug("qwen2_5_collate_fn", visual_inputs)
     return batch
 
 
@@ -587,6 +779,7 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     if "image_grid_thw" in batch:
         del batch["image_grid_thw"]
     batch["visual_inputs"] = visual_inputs
+    _log_visual_inputs_debug("default_collate_fn", visual_inputs)
     return batch
 
 
@@ -922,6 +1115,7 @@ def kimi_k25_vl_collate_fn(
     for k in ("pixel_values", "grid_thws"):
         result.pop(k, None)
     result["visual_inputs"] = visual_inputs
+    _log_visual_inputs_debug("kimi_k25_vl_collate_fn", visual_inputs)
     return result
 
 
