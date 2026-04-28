@@ -1,0 +1,367 @@
+# syntax=docker/dockerfile:1.7
+# ==============================================================================
+# Dockerfile for Qwen3.5-122B-A10B SFT — ALL-IN-ONE (no runtime install step)
+# ------------------------------------------------------------------------------
+# Differences vs. Dockerfile.qwen35 (the "pure environment" image):
+#
+#   1. Bakes the Megatron-Bridge source tree into /opt/Megatron-Bridge.
+#   2. Bakes the Megatron-LM submodule (3rdparty/Megatron-LM) into the image.
+#   3. Runs `uv sync` at build time → installs megatron-core editable + every
+#      pyproject.toml / dependency-group package into /opt/venv-mbridge,
+#      reusing the same exclusion flags as scripts/install_runtime_deps.sh.
+#   4. Runs `uv pip install -e /opt/Megatron-Bridge --no-deps` so
+#      `import megatron.bridge` works out of the box.
+#
+# Result: the container is **immediately usable** — no need to run
+# `bash scripts/install_runtime_deps.sh` after `docker run`.
+#
+# How to use the /mnt source tree instead of the baked one
+# --------------------------------------------------------
+# Editable installs are path-based. To override the baked source with the
+# NAS copy (so live edits are picked up), bind-mount your repo onto the
+# same path:
+#
+#   docker run --rm -it --gpus all --shm-size=64g --ulimit memlock=-1 \
+#     --network host \
+#     -v /mnt/tidal-alsh01:/mnt/tidal-alsh01 \
+#     -v /mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge:/opt/Megatron-Bridge \
+#     qwen35-mbridge:cu129-allinone bash
+#
+# The bind-mount overlays /opt/Megatron-Bridge with the NAS repo at the same
+# path, so the editable install's .pth file still resolves correctly.
+#
+# Prerequisites (run on the build host BEFORE `docker build`)
+# -----------------------------------------------------------
+#   1) Initialize the Megatron-LM submodule so it is COPYable:
+#        git submodule update --init --recursive
+#   2) Download the prebuilt wheels (~780 MB) into docker/runtime_wheels/
+#      (same as Dockerfile.qwen35; see that file for exact URLs).
+#
+# Build:
+#   docker build -f Dockerfile.qwen35.allinone -t qwen35-mbridge:cu129-allinone .
+#
+# Run (each node):
+#   docker run --rm -it --gpus all --shm-size=64g --ulimit memlock=-1 \
+#     --network host \
+#     -v /mnt/tidal-alsh01:/mnt/tidal-alsh01 \
+#     qwen35-mbridge:cu129-allinone bash
+#
+#   # Inside the container — directly start training, no setup step:
+#   cd /opt/Megatron-Bridge
+#   RANK=<N> MASTER_PORT=23456 bash /mnt/tidal-alsh01/dataset/redone/hade/dd/start.sh
+# ==============================================================================
+
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.06-py3
+FROM ${BASE_IMAGE}
+
+# ------------------------------------------------------------------------------
+# Build-time configuration
+# ------------------------------------------------------------------------------
+ARG UV_VERSION=0.9.18
+ARG VENV_DIR=/opt/venv-mbridge
+ARG FLA_VERSION=0.4.2
+ARG MBRIDGE_SRC=/opt/Megatron-Bridge
+
+# ------------------------------------------------------------------------------
+# Runtime environment
+# ------------------------------------------------------------------------------
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Shanghai \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    MBRIDGE_VENV_DIR=${VENV_DIR} \
+    MBRIDGE_SRC_DIR=${MBRIDGE_SRC} \
+    HF_HOME=/workspace/hf_cache \
+    CUDA_DEVICE_MAX_CONNECTIONS=1 \
+    NCCL_NVLS_ENABLE=0 \
+    TORCH_NCCL_AVOID_RECORD_STREAMS=1 \
+    MBRIDGE_DISABLE_CUDNN=0 \
+    FLA_AUTOTUNE=0 \
+    PATH=${VENV_DIR}/bin:${PATH}
+
+# ------------------------------------------------------------------------------
+# OS deps + timezone
+# ------------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git git-lfs ninja-build cmake curl ca-certificates jq tmux less \
+        tzdata \
+    && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------------------------
+# uv — package manager
+# ------------------------------------------------------------------------------
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv --version
+
+# ------------------------------------------------------------------------------
+# Create venv inheriting NGC's whole site-packages (file-presence check only;
+# build host has no GPU so we cannot import torch / TE / flash-attn / APEX).
+# ------------------------------------------------------------------------------
+RUN uv venv ${VENV_DIR} --python /usr/bin/python3.12 \
+        --system-site-packages --seed && \
+    SP_NGC=/usr/local/lib/python3.12/dist-packages; \
+    for f in \
+        torch/__init__.py \
+        transformer_engine/__init__.py \
+        flash_attn/__init__.py \
+        apex/__init__.py \
+    ; do \
+        test -f "$SP_NGC/$f" \
+            && echo "  ok (NGC)  $f" \
+            || { echo "  FAIL (NGC)  $f — is base image correct?"; exit 1; }; \
+    done
+
+# ------------------------------------------------------------------------------
+# causal-conv1d + mamba-ssm prebuilt wheels (NGC nv25.06 ABI workaround)
+# See Dockerfile.qwen35 / memory.md §Mamba-SSM ABI Workaround for full notes.
+# ------------------------------------------------------------------------------
+ARG WHEELS_DIR=docker/runtime_wheels
+ARG CAUSAL_WHEEL=causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+ARG MAMBA_WHEEL=mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+
+COPY ${WHEELS_DIR}/${CAUSAL_WHEEL} /tmp/wheels/${CAUSAL_WHEEL}
+COPY ${WHEELS_DIR}/${MAMBA_WHEEL}  /tmp/wheels/${MAMBA_WHEEL}
+
+RUN ${VENV_DIR}/bin/pip install --no-cache-dir --no-deps \
+        /tmp/wheels/${CAUSAL_WHEEL} \
+        /tmp/wheels/${MAMBA_WHEEL} && \
+    rm -rf /tmp/wheels
+
+# flash-linear-attention (pure Python; fla-core is the actual fla package).
+RUN ${VENV_DIR}/bin/pip install --no-cache-dir --no-deps \
+        flash-linear-attention==${FLA_VERSION} && \
+    ${VENV_DIR}/bin/pip install --no-cache-dir --no-deps \
+        fla-core==${FLA_VERSION}
+
+# ------------------------------------------------------------------------------
+# Patch mamba_ssm/__init__.py — make selective_scan_cuda import non-fatal.
+# (See Dockerfile.qwen35 for full explanation.)
+# ------------------------------------------------------------------------------
+RUN cat > ${VENV_DIR}/lib/python3.12/site-packages/mamba_ssm/__init__.py <<'PYEOF'
+__version__ = "2.3.1"
+
+# NGC nv25.06 patched torch 2.8 ABI is between stock torch 2.9 and 2.10; no
+# upstream prebuilt mamba_ssm wheel matches. We install the cu12torch2.8 wheel
+# and make the failing selective_scan_cuda import non-fatal — Mamba1 paths are
+# unused by Qwen3.5-VL (which uses the Triton-only ssd_combined path).
+#
+# Catch BaseException so module-level Triton autotune calls (which raise
+# RuntimeError on a no-GPU host) do not break `import mamba_ssm`.
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn  # noqa: F401
+except BaseException as _e:
+    selective_scan_fn = None
+    mamba_inner_fn = None
+    import warnings
+    warnings.warn(
+        "mamba_ssm.selective_scan_cuda failed to load "
+        "(NGC torch ABI mismatch, or no-GPU build host); "
+        "selective_scan_fn / mamba_inner_fn / Mamba1 will not work, but the "
+        "Triton-based mamba_ssm.ops.triton.ssd_combined path used by "
+        "megatron-core (Mamba2 / GDN) is unaffected. Original error: " + str(_e)
+    )
+
+try:
+    from mamba_ssm.modules.mamba_simple import Mamba  # noqa: F401
+except BaseException:
+    Mamba = None
+
+try:
+    from mamba_ssm.modules.mamba2 import Mamba2  # noqa: F401
+except BaseException:
+    Mamba2 = None
+
+try:
+    from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # noqa: F401
+except BaseException:
+    MambaLMHeadModel = None
+PYEOF
+
+# ------------------------------------------------------------------------------
+# Pre-bake stable pure-Python deps. Same two-step approach as Dockerfile.qwen35
+# (PyPI step + nvidia-resiliency-ext step) to keep pip's resolver scope small.
+# ------------------------------------------------------------------------------
+COPY docker/requirements-prebaked.txt /tmp/requirements-prebaked.txt
+RUN ${VENV_DIR}/bin/pip install --no-cache-dir \
+        -r /tmp/requirements-prebaked.txt \
+    && rm /tmp/requirements-prebaked.txt
+RUN ${VENV_DIR}/bin/pip install --no-cache-dir --upgrade \
+        --extra-index-url https://pypi.nvidia.com \
+        "nvidia-resiliency-ext"
+
+# ------------------------------------------------------------------------------
+# COPY Megatron-Bridge source + Megatron-LM submodule into the image.
+#
+# Selective COPY (avoids dragging docker/runtime_wheels/*.whl ~780 MB into the
+# layer; those wheels were already installed above):
+#   - pyproject.toml / uv.lock / README.md / LICENSE   → uv sync inputs
+#   - src/                                              → megatron.bridge code
+#   - 3rdparty/Megatron-LM/                             → editable megatron-core
+#   - scripts/, run/, tests/, examples/, tutorials/, docs/  → operator artifacts
+# ------------------------------------------------------------------------------
+COPY pyproject.toml uv.lock README.md LICENSE ${MBRIDGE_SRC}/
+COPY src/                 ${MBRIDGE_SRC}/src/
+COPY 3rdparty/Megatron-LM ${MBRIDGE_SRC}/3rdparty/Megatron-LM
+COPY scripts/             ${MBRIDGE_SRC}/scripts/
+COPY run/                 ${MBRIDGE_SRC}/run/
+
+# Sanity: submodule must be initialized on the build host.
+RUN test -f ${MBRIDGE_SRC}/3rdparty/Megatron-LM/megatron/core/__init__.py \
+    || { echo "FATAL: 3rdparty/Megatron-LM submodule is empty on build host."; \
+         echo "Run 'git submodule update --init --recursive' before docker build."; \
+         exit 1; }
+
+# ------------------------------------------------------------------------------
+# uv sync — install megatron-core editable + every pyproject.toml dependency
+# into the venv. Mirrors scripts/install_runtime_deps.sh exclusion flags.
+# ------------------------------------------------------------------------------
+WORKDIR ${MBRIDGE_SRC}
+RUN UV_PROJECT_ENVIRONMENT="${VENV_DIR}" \
+    /usr/local/bin/uv sync \
+        --link-mode copy \
+        --inexact \
+        --all-extras \
+        --all-groups \
+        --no-install-package torch \
+        --no-install-package torchvision \
+        --no-install-package triton \
+        --no-install-package transformer-engine \
+        --no-install-package transformer-engine-torch \
+        --no-install-package transformer-engine-cu12 \
+        --no-install-package flash-attn \
+        --no-install-package mamba-ssm \
+        --no-install-package causal-conv1d \
+        --no-install-package flash-linear-attention \
+        --no-install-package fla-core \
+        --no-install-package nvidia-cublas \
+        --no-install-package nvidia-cublas-cu12 \
+        --no-install-package nvidia-cublas-cu13 \
+        --no-install-package nvidia-cuda-cupti \
+        --no-install-package nvidia-cuda-cupti-cu12 \
+        --no-install-package nvidia-cuda-cupti-cu13 \
+        --no-install-package nvidia-cuda-nvrtc \
+        --no-install-package nvidia-cuda-nvrtc-cu12 \
+        --no-install-package nvidia-cuda-nvrtc-cu13 \
+        --no-install-package nvidia-cuda-runtime \
+        --no-install-package nvidia-cuda-runtime-cu12 \
+        --no-install-package nvidia-cuda-runtime-cu13 \
+        --no-install-package nvidia-cudnn-cu12 \
+        --no-install-package nvidia-cudnn-cu13 \
+        --no-install-package nvidia-cufft \
+        --no-install-package nvidia-cufft-cu12 \
+        --no-install-package nvidia-cufft-cu13 \
+        --no-install-package nvidia-cufile \
+        --no-install-package nvidia-curand \
+        --no-install-package nvidia-curand-cu12 \
+        --no-install-package nvidia-curand-cu13 \
+        --no-install-package nvidia-cusolver \
+        --no-install-package nvidia-cusolver-cu12 \
+        --no-install-package nvidia-cusolver-cu13 \
+        --no-install-package nvidia-cusparse \
+        --no-install-package nvidia-cusparse-cu12 \
+        --no-install-package nvidia-cusparse-cu13 \
+        --no-install-package nvidia-cusparselt-cu12 \
+        --no-install-package nvidia-cusparselt-cu13 \
+        --no-install-package nvidia-nccl-cu12 \
+        --no-install-package nvidia-nccl-cu13 \
+        --no-install-package nvidia-nvjitlink \
+        --no-install-package nvidia-nvjitlink-cu12 \
+        --no-install-package nvidia-nvjitlink-cu13 \
+        --no-install-package nvidia-nvshmem-cu12 \
+        --no-install-package nvidia-nvshmem-cu13 \
+        --no-install-package nvidia-nvtx \
+        --no-install-package nvidia-nvtx-cu12 \
+        --no-install-package nvidia-nvtx-cu13 \
+        --no-install-package cuda-toolkit \
+        --no-install-package apex
+
+# ------------------------------------------------------------------------------
+# Install megatron-bridge itself as editable (no deps — already resolved above).
+# The .pth file written by setuptools points at ${MBRIDGE_SRC}/src, so
+# bind-mounting a different repo at ${MBRIDGE_SRC} at runtime transparently
+# overrides the baked source.
+# ------------------------------------------------------------------------------
+RUN /usr/local/bin/uv pip install \
+        --link-mode copy \
+        --python ${VENV_DIR}/bin/python \
+        --no-deps \
+        -e ${MBRIDGE_SRC}
+
+# Strip any stale te_distributed_compat.pth (see Pitfall #21 in memory.md).
+RUN find ${VENV_DIR}/lib/python3.12/site-packages \
+        -maxdepth 1 -name 'te_distributed_compat.pth' -delete || true
+
+# ------------------------------------------------------------------------------
+# Build-time sanity — pure shell, no Python imports (no GPU on build host).
+# ------------------------------------------------------------------------------
+RUN set -e; \
+    SP=${VENV_DIR}/lib/python3.12/site-packages; \
+    SP_NGC=/usr/local/lib/python3.12/dist-packages; \
+    echo "=== Build-time sanity (file-presence only, no GPU required) ==="; \
+    echo "--- baked-in wheels (causal-conv1d, mamba-ssm, fla) ---"; \
+    for f in \
+        causal_conv1d/__init__.py \
+        mamba_ssm/__init__.py \
+        mamba_ssm/ops/triton/ssd_combined.py \
+        fla/__init__.py \
+    ; do \
+        test -f "$SP/$f" \
+            && echo "  ok    $f" \
+            || { echo "  FAIL  $f"; exit 1; }; \
+    done; \
+    grep -q "NGC nv25.06 patched torch" "$SP/mamba_ssm/__init__.py" \
+        && echo "  ok    mamba_ssm ABI patch present" \
+        || { echo "  FAIL  mamba_ssm patch missing"; exit 1; }; \
+    echo "--- baked source (megatron-bridge + megatron-core) ---"; \
+    test -f ${MBRIDGE_SRC}/src/megatron/bridge/__init__.py \
+        && echo "  ok    ${MBRIDGE_SRC}/src/megatron/bridge/__init__.py" \
+        || { echo "  FAIL  megatron-bridge source missing"; exit 1; }; \
+    test -f ${MBRIDGE_SRC}/3rdparty/Megatron-LM/megatron/core/__init__.py \
+        && echo "  ok    ${MBRIDGE_SRC}/3rdparty/Megatron-LM/megatron/core/__init__.py" \
+        || { echo "  FAIL  megatron-core submodule missing"; exit 1; }; \
+    echo "--- editable install .pth files ---"; \
+    ls $SP/__editable__*.pth $SP/_megatron_bridge*.pth 2>/dev/null \
+        | grep -E "megatron|bridge" \
+        && echo "  ok    editable .pth present" \
+        || echo "  note  no obvious editable .pth (uv may use _virtualenv)"; \
+    echo "--- prebaked pure-Python deps (spot check) ---"; \
+    check_file() { \
+        local f="$1"; \
+        if test -f "$SP/$f"; then echo "  ok    $f  (venv)"; \
+        elif test -f "$SP_NGC/$f"; then echo "  ok    $f  (NGC)"; \
+        else echo "  FAIL  $f"; return 1; fi; \
+    }; \
+    check_dir() { \
+        local d="$1"; \
+        if test -d "$SP/$d"; then echo "  ok    $d/  (venv)"; \
+        elif test -d "$SP_NGC/$d"; then echo "  ok    $d/  (NGC)"; \
+        else echo "  FAIL  $d/"; return 1; fi; \
+    }; \
+    check_file transformers/__init__.py; \
+    check_file peft/__init__.py; \
+    check_file datasets/__init__.py; \
+    check_file accelerate/__init__.py; \
+    check_file omegaconf/__init__.py; \
+    check_file wandb/__init__.py; \
+    check_file hydra/_internal/__init__.py; \
+    check_dir  nvidia_resiliency_ext/fault_tolerance; \
+    test -x "${VENV_DIR}/bin/ruff" \
+        && echo "  ok    ruff  (venv bin)" \
+        || { echo "  FAIL  ruff not found in ${VENV_DIR}/bin/"; exit 1; }; \
+    echo "=== sanity OK — container is ready out of the box ==="
+
+# ------------------------------------------------------------------------------
+# Entrypoint (same as Dockerfile.qwen35 — sets up PATH and execs user command).
+# ------------------------------------------------------------------------------
+COPY docker/entrypoint-mbridge.sh /usr/local/bin/entrypoint-mbridge.sh
+RUN chmod +x /usr/local/bin/entrypoint-mbridge.sh
+
+WORKDIR ${MBRIDGE_SRC}
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-mbridge.sh"]
+CMD ["bash"]
