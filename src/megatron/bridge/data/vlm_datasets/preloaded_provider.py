@@ -30,6 +30,7 @@ from megatron.bridge.data.vlm_datasets.conversation_dataset import VLMConversati
 from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
 from megatron.bridge.training.config import DatasetBuildContext, DatasetProvider
 
+
 try:
     from qwen_vl_utils import process_vision_info
 
@@ -898,9 +899,7 @@ class PreloadedVLMConversationProvider(DatasetProvider):
         overlength_samples: List[Tuple[int, int]] = []
         max_overlength = 0
         for raw_idx, rec in enumerate(raw_examples, start=1):
-            base_example = _record_to_preloaded_example(
-                rec, self.image_folder, tool_call_format=self.tool_call_format
-            )
+            base_example = _record_to_preloaded_example(rec, self.image_folder, tool_call_format=self.tool_call_format)
             if base_example is None:
                 continue
             if self.drop_overlength_samples:
@@ -937,10 +936,17 @@ class PreloadedVLMConversationProvider(DatasetProvider):
         if not base_examples:
             _LOGGER.warning(f"No usable examples parsed from {split_name}")
             return None
+        # Pass seq_length as max_length so the collate function hard-truncates
+        # sequences that exceed the model context window.  This is the framework-
+        # side fix for Pitfall #23: without max_length the processor falls back to
+        # tokenizer.model_max_length (~128K) and overlength multimodal samples
+        # (vision_tokens + text_tokens > seq_length) reach PP stage-0 unchanged,
+        # causing tensor shape mismatches or attention OOM.
         return VLMConversationDataset(
             base_examples=base_examples,
             target_length=target_length,
             processor=processor,
+            max_length=self.seq_length,
         )
 
     def _build_split_dataset(

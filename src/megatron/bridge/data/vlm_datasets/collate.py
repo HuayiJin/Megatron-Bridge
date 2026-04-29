@@ -239,8 +239,8 @@ def _log_tool_loss_mask_debug(example: dict, ids: list[int], mask: list[int], to
     if not tool_call_candidate_groups and not tool_response_spans:
         return
 
-    tool_call_tokens, tool_call_unmasked_tokens, missing_tool_call_spans = (
-        _count_unmasked_tokens_for_candidate_groups(tool_call_candidate_groups, ids, mask, tokenizer)
+    tool_call_tokens, tool_call_unmasked_tokens, missing_tool_call_spans = _count_unmasked_tokens_for_candidate_groups(
+        tool_call_candidate_groups, ids, mask, tokenizer
     )
     tool_response_tokens, tool_response_unmasked_tokens, missing_tool_response_spans = (
         _count_unmasked_tokens_for_candidate_groups([[span] for span in tool_response_spans], ids, mask, tokenizer)
@@ -346,8 +346,24 @@ def phi4_mm_collate_fn(examples, processor):
     return batch
 
 
-def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
-    """Collate function for Qwen2.5 VL model."""
+def qwen2_5_collate_fn(
+    examples: list,
+    processor,
+    *,
+    max_length: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """Collate function for Qwen2.5 VL model.
+
+    Args:
+        examples: List of conversation examples.
+        processor: HuggingFace processor instance.
+        max_length: If set, sequences are hard-truncated to this many tokens.
+            Should be set to ``dataset.seq_length`` so that overlength
+            multimodal samples (vision tokens + text tokens > seq_length) are
+            silently truncated rather than causing PP stage-0 shape mismatches.
+            When ``None`` the processor's ``model_max_length`` (~128 K) is used
+            as the fallback, which is almost certainly wrong for training.
+    """
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
 
@@ -372,6 +388,14 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     batch_with = None
     batch_without = None
 
+    # Truncation kwargs: always enable truncation; respect max_length when provided.
+    # Without max_length the processor falls back to tokenizer.model_max_length (~128K)
+    # which is far larger than the training seq_length and causes PP shape mismatches
+    # when vision tokens push the total sequence beyond seq_length (Pitfall #23).
+    trunc_kwargs: dict = {"truncation": True}
+    if max_length is not None:
+        trunc_kwargs["max_length"] = max_length
+
     if idx_with:
         texts_with = [texts[i] for i in idx_with]
         images_with = [per_example_images[i] for i in idx_with]
@@ -382,6 +406,7 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
             return_tensors="pt",
             min_pixels=200704,  # 256*28*28
             max_pixels=1003520,  # 1280*28*28
+            **trunc_kwargs,
         )
 
         batch_with = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in batch_with.items()}
@@ -392,6 +417,7 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
             text=texts_without,
             padding=True,
             return_tensors="pt",
+            **trunc_kwargs,
         )
 
         batch_without = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in batch_without.items()}

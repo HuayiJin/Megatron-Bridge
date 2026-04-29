@@ -16,6 +16,7 @@
 Core dataset types for conversation-style VLM examples.
 """
 
+import inspect
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -41,16 +42,43 @@ class VLMConversationDataset(torch.utils.data.Dataset):
         target_length: int,
         processor: Any,
         collate_impl: Optional[Callable[[list, Any], Dict[str, torch.Tensor]]] = None,
+        *,
+        max_length: Optional[int] = None,
     ) -> None:
+        """Initialize the dataset.
+
+        Args:
+            base_examples: Non-empty list of conversation dicts.
+            target_length: Virtual dataset length (wraps around base_examples).
+            processor: HuggingFace processor used to tokenise examples.
+            collate_impl: Optional override for the collate function. When
+                ``None`` the implementation is chosen from ``COLLATE_FNS``
+                based on the processor type name.
+            max_length: Hard truncation limit (in tokens) forwarded to the
+                collate function. Should equal ``dataset.seq_length`` so that
+                sequences exceeding the model's context window are silently
+                truncated in the DataLoader rather than causing PP shape
+                mismatches at runtime (Pitfall #23).
+        """
         assert isinstance(base_examples, list) and len(base_examples) > 0, "base_examples must be a non-empty list"
         self._base_examples = base_examples
         self._length = int(max(0, target_length))
         self._processor = processor
+        self._max_length = max_length
         # Choose collate implementation by processor type name when not provided
         collate_key = type(processor).__name__ if processor is not None else "default"
         selected_impl = collate_impl or COLLATE_FNS.get(collate_key, COLLATE_FNS["default"])  # type: ignore[index]
 
+        # Determine at construction time whether the chosen collate function
+        # accepts a ``max_length`` keyword argument.  This avoids a TypeError
+        # when ``max_length`` is set but the collate implementation does not
+        # declare the parameter (e.g. glm4v_collate_fn, default_collate_fn).
+        _collate_accepts_max_length = "max_length" in inspect.signature(selected_impl).parameters
+        _max_length = max_length  # capture for closure
+
         def _bound_collate(batch: list) -> Dict[str, torch.Tensor]:
+            if _max_length is not None and _collate_accepts_max_length:
+                return selected_impl(batch, self._processor, max_length=_max_length)  # type: ignore[call-arg]
             return selected_impl(batch, self._processor)  # type: ignore[call-arg]
 
         self.collate_fn = _bound_collate
