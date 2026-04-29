@@ -16,6 +16,7 @@ import json
 import os
 import tempfile
 
+import pytest
 import torch
 
 import megatron.bridge.data.vlm_datasets.preloaded_provider as pre
@@ -88,6 +89,127 @@ def test_record_to_conversation_legacy_and_llava(tmp_path):  # noqa: ARG001 - tm
         image_folder=None,
     )
     assert conv2[0]["role"] == "user"
+
+
+def test_record_to_conversation_qwen_agent_tool_roles():
+    conv = pre._record_to_conversation(  # noqa: SLF001
+        {
+            "tools": [
+                {
+                    "name": "search",
+                    "description": "Search documents.",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                }
+            ],
+            "messages": [
+                {"role": "system", "content": "You are careful."},
+                {"role": "user", "content": "Find papers."},
+                {"role": "tool_call", "content": '{"name": "search", "arguments": {"query": "vlm"}}'},
+                {"role": "tool_call", "content": '{"name": "search", "arguments": {"query": "tool"}}'},
+                {"role": "tool", "content": "first result"},
+                {"role": "tool_response", "content": {"ok": True}},
+                {"role": "assistant", "content": "Done."},
+            ],
+        },
+        image_folder=None,
+    )
+
+    assert [message["role"] for message in conv] == ["system", "user", "assistant", "tool", "tool", "assistant"]
+    assert conv[2]["tool_calls"] == [
+        {
+            "id": "1",
+            "type": "function",
+            "function": {"name": "search", "arguments": {"query": "vlm"}},
+        },
+        {
+            "id": "2",
+            "type": "function",
+            "function": {"name": "search", "arguments": {"query": "tool"}},
+        },
+    ]
+    assert conv[3]["id"] == "1"
+    assert conv[4]["id"] == "2"
+    assert conv[3]["content"][0]["text"] == "first result"
+    assert conv[4]["content"][0]["text"] == '{"ok": true}'
+
+
+def test_record_to_preloaded_example_preserves_qwen_agent_tools():
+    example = pre._record_to_preloaded_example(  # noqa: SLF001
+        {
+            "tools": [{"name": "search", "parameters": {"type": "object", "properties": {}}}],
+            "messages": [{"role": "user", "content": "Find papers."}, {"role": "assistant", "content": "Done."}],
+        },
+        image_folder=None,
+        tool_call_format="auto",
+    )
+
+    assert example["tools"] == [
+        {"type": "function", "function": {"name": "search", "parameters": {"type": "object", "properties": {}}}}
+    ]
+
+
+def test_record_to_conversation_qwen_agent_assigns_media_globally():
+    conv = pre._record_to_conversation(  # noqa: SLF001
+        {
+            "tools": [{"name": "inspect", "parameters": {"type": "object", "properties": {}}}],
+            "images": ["first.png", "second.png"],
+            "messages": [
+                {"role": "user", "content": "look <image>"},
+                {"role": "tool_call", "content": '{"name": "inspect", "arguments": {}}'},
+                {"role": "tool", "content": "tool saw <image>"},
+                {"role": "assistant", "content": "ok"},
+            ],
+        },
+        image_folder="/abs",
+    )
+
+    assert conv[1]["content"][1] == {"type": "image", "image": "/abs/first.png"}
+    assert {"type": "image", "image": "/abs/second.png"} in conv[3]["content"]
+    assert conv[3]["role"] == "tool"
+
+
+def test_record_to_conversation_qwen_agent_rejects_media_mismatch():
+    with pytest.raises(ValueError, match="Image placeholder count mismatch"):
+        pre._record_to_conversation(  # noqa: SLF001
+            {
+                "tools": [{"name": "search", "parameters": {"type": "object", "properties": {}}}],
+                "images": ["unused.png"],
+                "messages": [{"role": "user", "content": "no media"}, {"role": "assistant", "content": "ok"}],
+            },
+            image_folder=None,
+        )
+
+
+def test_record_to_conversation_qwen_agent_openai_tool_calls():
+    conv = pre._record_to_conversation(  # noqa: SLF001
+        {
+            "messages": [
+                {"role": "user", "content": "find it"},
+                {
+                    "role": "assistant",
+                    "content": "Checking.",
+                    "tool_calls": [
+                        {"function": {"name": "search", "arguments": '{"query": "qwen"}'}},
+                    ],
+                },
+                {"role": "tool", "content": "hit"},
+                {"role": "assistant", "content": "final"},
+            ]
+        },
+        image_folder=None,
+    )
+
+    assert [message["role"] for message in conv] == ["user", "assistant", "tool", "assistant"]
+    assistant_text = conv[1]["content"][0]["text"]
+    assert assistant_text == "Checking."
+    assert conv[1]["tool_calls"] == [
+        {
+            "id": "1",
+            "type": "function",
+            "function": {"name": "search", "arguments": {"query": "qwen"}},
+        }
+    ]
+    assert conv[2]["id"] == "1"
 
 
 def test_load_and_build_provider(monkeypatch):

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import torch
 
 import megatron.bridge.data.vlm_datasets.collate as collate
@@ -51,6 +53,85 @@ class _DummyProcessor:
         return out
 
 
+class _CharProcessor:
+    tokenizer = None
+
+    def __init__(self):
+        self.tokenizer = self
+
+    def __call__(self, text, add_special_tokens=False):  # noqa: ARG002 - tokenizer API parity
+        return {"input_ids": [ord(char) for char in text]}
+
+
+def test_tool_loss_mask_debug_logs_tool_call_and_response(caplog):
+    tool_call = '<tool_call>{"name": "search", "arguments": {"query": "vlm"}}</tool_call>'
+    tool_response = "<tool_response>hit</tool_response>"
+    final_answer = "Done."
+    input_text = f"user:{tool_call}{tool_response}{final_answer}"
+    input_ids = torch.tensor([ord(char) for char in input_text])
+    example = {
+        "conversation": [
+            {"role": "user", "content": [{"type": "text", "text": "user:"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": tool_call}]},
+            {"role": "user", "content": [{"type": "text", "text": tool_response}]},
+            {"role": "assistant", "content": [{"type": "text", "text": final_answer}]},
+        ]
+    }
+
+    caplog.set_level(logging.DEBUG, logger=collate.logger.name)
+    mask = collate.create_multiturn_loss_mask_by_search(
+        example,
+        input_ids,
+        _CharProcessor(),
+        skipped_tokens=torch.tensor([], dtype=torch.long),
+    )
+
+    tool_call_start = input_text.index(tool_call)
+    tool_call_end = tool_call_start + len(tool_call)
+    tool_response_start = input_text.index(tool_response)
+    tool_response_end = tool_response_start + len(tool_response)
+
+    assert all(mask[tool_call_start:tool_call_end])
+    assert not any(mask[tool_response_start:tool_response_end])
+    assert "tool_call_unmasked_tokens=" in caplog.text
+    assert "tool_response_unmasked_tokens=0/" in caplog.text
+
+
+def test_structured_tool_calls_are_in_assistant_loss_mask(caplog):
+    tool_call = "<tool_call>\n<function=search>\n<parameter=query>\nvlm\n</parameter>\n</function>\n</tool_call>"
+    input_text = f"user:{tool_call}"
+    input_ids = torch.tensor([ord(char) for char in input_text])
+    example = {
+        "conversation": [
+            {"role": "user", "content": [{"type": "text", "text": "user:"}]},
+            {
+                "role": "assistant",
+                "content": [],
+                "tool_calls": [
+                    {
+                        "id": "1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": {"query": "vlm"}},
+                    }
+                ],
+            },
+        ]
+    }
+
+    caplog.set_level(logging.DEBUG, logger=collate.logger.name)
+    mask = collate.create_multiturn_loss_mask_by_search(
+        example,
+        input_ids,
+        _CharProcessor(),
+        skipped_tokens=torch.tensor([], dtype=torch.long),
+    )
+
+    tool_call_start = input_text.index(tool_call)
+    tool_call_end = tool_call_start + len(tool_call)
+    assert all(mask[tool_call_start:tool_call_end])
+    assert "tool_call_unmasked_tokens=" in caplog.text
+
+
 def test_default_collate_builds_visual_inputs(monkeypatch):
     # Force HAVE_QWEN_VL_UTILS True
     monkeypatch.setattr(collate, "HAVE_QWEN_VL_UTILS", True)
@@ -77,6 +158,32 @@ def test_qwen2_5_collate_fn_handles_no_images(monkeypatch):
     batch = collate.qwen2_5_collate_fn(examples, proc)
     assert "input_ids" in batch and "labels" in batch and "loss_mask" in batch
     assert "visual_inputs" in batch
+
+
+def test_qwen2_5_collate_fn_passes_tools_to_chat_template(monkeypatch):
+    class _ToolAwareProcessor(_DummyProcessor):
+        def __init__(self):
+            super().__init__()
+            self.chat_template_kwargs = []
+
+        def apply_chat_template(self, conversation, tokenize=False, **kwargs):
+            self.chat_template_kwargs.append(kwargs)
+            return super().apply_chat_template(conversation, tokenize=tokenize, **kwargs)
+
+    monkeypatch.setattr(collate, "HAVE_QWEN_VL_UTILS", True)
+    monkeypatch.setattr(collate, "process_vision_info", lambda conv: (None, None))
+    proc = _ToolAwareProcessor()
+    tools = [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}]
+    examples = [
+        {
+            "conversation": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "tools": tools,
+        },
+    ]
+
+    collate.qwen2_5_collate_fn(examples, proc)
+
+    assert proc.chat_template_kwargs[0]["tools"] == tools
 
 
 def test_qwen2_audio_collate_fn_uses_audio_inputs_key(monkeypatch):

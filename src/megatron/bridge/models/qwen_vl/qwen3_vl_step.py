@@ -36,6 +36,135 @@ from megatron.bridge.training.utils.pg_utils import get_pg_collection
 
 
 logger = logging.getLogger(__name__)
+_G_MAX_VISUAL_TOKEN_ALIGNMENT_WARNINGS = 8
+_G_VISUAL_TOKEN_ALIGNMENT_WARNING_COUNT = 0
+
+
+def _shape_or_none(value: Any) -> tuple[int, ...] | None:
+    if isinstance(value, torch.Tensor):
+        return tuple(value.shape)
+    return None
+
+
+def _distributed_rank_or_none() -> int | None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return None
+
+
+def _count_token_id(tokens: torch.Tensor | None, token_id: int | None) -> int | None:
+    if tokens is None or token_id is None:
+        return None
+    return int((tokens == token_id).sum().item())
+
+
+def _has_visual_inputs(multi_modal_inputs: dict[str, Any]) -> bool:
+    return any(
+        multi_modal_inputs.get(key) is not None
+        for key in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw")
+    )
+
+
+def _maybe_log_visual_token_alignment(
+    *,
+    source: str,
+    tokens_before: torch.Tensor,
+    tokens_after: torch.Tensor,
+    multi_modal_inputs: dict[str, Any],
+    config: Any,
+    forced_seq_length: int | None,
+) -> None:
+    """Log when fixed-length sequence clamping drops visual placeholder tokens."""
+    global _G_VISUAL_TOKEN_ALIGNMENT_WARNING_COUNT
+
+    if not _has_visual_inputs(multi_modal_inputs):
+        return
+
+    image_token_id = getattr(config, "image_token_id", None)
+    video_token_id = getattr(config, "video_token_id", None)
+    image_before = _count_token_id(tokens_before, image_token_id)
+    image_after = _count_token_id(tokens_after, image_token_id)
+    video_before = _count_token_id(tokens_before, video_token_id)
+    video_after = _count_token_id(tokens_after, video_token_id)
+
+    before_total = (image_before or 0) + (video_before or 0)
+    after_total = (image_after or 0) + (video_after or 0)
+    should_warn = before_total == 0 or after_total < before_total
+
+    if not should_warn:
+        logger.debug(
+            "Qwen3VL visual token alignment ok: source=%s rank=%s seq_length=%s "
+            "input_seq_len_before=%s input_seq_len_after=%s image_tokens_before=%s "
+            "image_tokens_after=%s video_tokens_before=%s video_tokens_after=%s "
+            "pixel_values_shape=%s image_grid_thw_shape=%s pixel_values_videos_shape=%s "
+            "video_grid_thw_shape=%s",
+            source,
+            _distributed_rank_or_none(),
+            forced_seq_length,
+            tokens_before.shape[1],
+            tokens_after.shape[1],
+            image_before,
+            image_after,
+            video_before,
+            video_after,
+            _shape_or_none(multi_modal_inputs.get("pixel_values")),
+            _shape_or_none(multi_modal_inputs.get("image_grid_thw")),
+            _shape_or_none(multi_modal_inputs.get("pixel_values_videos")),
+            _shape_or_none(multi_modal_inputs.get("video_grid_thw")),
+        )
+        return
+
+    if _G_VISUAL_TOKEN_ALIGNMENT_WARNING_COUNT >= _G_MAX_VISUAL_TOKEN_ALIGNMENT_WARNINGS:
+        return
+
+    _G_VISUAL_TOKEN_ALIGNMENT_WARNING_COUNT += 1
+    logger.warning(
+        "Qwen3VL visual token alignment warning: source=%s rank=%s seq_length=%s "
+        "input_seq_len_before=%s input_seq_len_after=%s image_token_id=%s video_token_id=%s "
+        "image_tokens_before=%s image_tokens_after=%s video_tokens_before=%s video_tokens_after=%s "
+        "pixel_values_shape=%s image_grid_thw_shape=%s pixel_values_videos_shape=%s "
+        "video_grid_thw_shape=%s. Visual inputs are present, but the text-side visual "
+        "placeholder token count is missing or decreased after sequence-length clamping. "
+        "If *_before is positive and *_after is zero, the fixed seq_length likely truncated "
+        "all visual pad tokens while keeping pixel_values/image_grid_thw.",
+        source,
+        _distributed_rank_or_none(),
+        forced_seq_length,
+        tokens_before.shape[1],
+        tokens_after.shape[1],
+        image_token_id,
+        video_token_id,
+        image_before,
+        image_after,
+        video_before,
+        video_after,
+        _shape_or_none(multi_modal_inputs.get("pixel_values")),
+        _shape_or_none(multi_modal_inputs.get("image_grid_thw")),
+        _shape_or_none(multi_modal_inputs.get("pixel_values_videos")),
+        _shape_or_none(multi_modal_inputs.get("video_grid_thw")),
+    )
+
+
+def _log_forward_visual_args(source: str, forward_args: dict[str, Any]) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    logger.debug(
+        "VLM forward visual-args check: "
+        "source=%s has_pixel_values=%s pixel_values_shape=%s "
+        "has_image_grid_thw=%s image_grid_thw_shape=%s "
+        "has_pixel_values_videos=%s pixel_values_videos_shape=%s "
+        "has_video_grid_thw=%s video_grid_thw_shape=%s",
+        source,
+        "pixel_values" in forward_args,
+        _shape_or_none(forward_args.get("pixel_values")),
+        "image_grid_thw" in forward_args,
+        _shape_or_none(forward_args.get("image_grid_thw")),
+        "pixel_values_videos" in forward_args,
+        _shape_or_none(forward_args.get("pixel_values_videos")),
+        "video_grid_thw" in forward_args,
+        _shape_or_none(forward_args.get("video_grid_thw")),
+    )
 
 
 def get_batch_from_iterator(
@@ -250,6 +379,7 @@ def forward_step(
     # Qwen3VL model need the original input and do cp and sp split in model.forward.
     pack_sequences_in_batch = getattr(state.cfg.dataset, "pack_sequences_in_batch", False)
 
+    tokens_before_pack = tokens
     tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = pack_or_pad_batch_sequences(
         tokens,
         labels,
@@ -260,6 +390,14 @@ def forward_step(
         use_fp8_padding=True,
         force_to_pad_to_seq_len=this_pg_collection.pp.size() > 1 or this_pg_collection.ep.size() > 1,
         seq_length=config.seq_length,
+    )
+    _maybe_log_visual_token_alignment(
+        source="qwen3_vl_step.pack_or_pad_batch_sequences",
+        tokens_before=tokens_before_pack,
+        tokens_after=tokens,
+        multi_modal_inputs=multi_modal_inputs,
+        config=config,
+        forced_seq_length=config.seq_length,
     )
     forward_args = {
         "input_ids": tokens,
@@ -300,6 +438,7 @@ def forward_step(
         forward_args["pixel_values_videos"] = multi_modal_inputs["pixel_values_videos"]
     if "video_grid_thw" in multi_modal_inputs:
         forward_args["video_grid_thw"] = multi_modal_inputs["video_grid_thw"]
+    _log_forward_visual_args("qwen3_vl_step", forward_args)
 
     check_for_nan_in_loss = state.cfg.rerun_state_machine.check_for_nan_in_loss
     check_for_spiky_loss = state.cfg.rerun_state_machine.check_for_spiky_loss

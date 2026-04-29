@@ -105,6 +105,19 @@ def cyclic_iter(iter: Iterable) -> Iterator:
             yield x
 
 
+def _preloaded_provider_has_validation(dataset_config: Any) -> bool:
+    if not hasattr(dataset_config, "valid_data_path"):
+        return True
+    validation_split_ratio = getattr(dataset_config, "validation_split_ratio", 0.0) or 0.0
+    return getattr(dataset_config, "valid_data_path") is not None or validation_split_ratio > 0.0
+
+
+def _preloaded_provider_has_test(dataset_config: Any) -> bool:
+    if not hasattr(dataset_config, "test_data_path"):
+        return True
+    return getattr(dataset_config, "test_data_path") is not None
+
+
 def get_train_valid_test_num_samples(cfg: ConfigContainer) -> tuple[int, int, int]:
     """Calculate the number of samples for train, validation, and test sets.
 
@@ -129,7 +142,10 @@ def get_train_valid_test_num_samples(cfg: ConfigContainer) -> tuple[int, int, in
         eval_iters = (cfg.train.train_iters // cfg.validation.eval_interval + 1) * cfg.validation.eval_iters
     else:
         eval_iters = 0
-    test_iters = cfg.validation.eval_iters
+    if not _preloaded_provider_has_validation(cfg.dataset):
+        eval_iters = 0
+
+    test_iters = cfg.validation.eval_iters if _preloaded_provider_has_test(cfg.dataset) else 0
 
     eval_gbs = (
         cfg.validation.eval_global_batch_size

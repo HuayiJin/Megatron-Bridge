@@ -1,38 +1,38 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
-# Qwen3.5-122B-A10B FULL SFT — 4 nodes × 8 GPU (= 32 × H800 80G).
+# Qwen3.5-122B-A10B FULL SFT — 6 nodes × 8 GPU (= 48 × H800 80G).
 #
 # Recipe: qwen35_vl_122b_a10b_sft_config
-#   default TP=2, PP=6, EP=8, LR=2e-5, GBS=36, seq=2048
+#   default TP=2, PP=6, EP=8, LR=2e-5, GBS=36, seq=4096
 #
-# IMPORTANT — parallelism on 32 GPU:
-#   TP=2 × PP=6 × EP=8 (recipe default) needs 96 GPU. On 32 GPU override:
-#     TP=2, PP=4, EP=4, DP=4.
-#   Math: world_size=32, DP=32/(TP×PP)=32/(2×4)=4. EP must ≤ DP → EP=4.
-#   EP=8 > DP=4 is INVALID (Megatron-Core asserts); do not use EP=8 on 32 GPU.
+# IMPORTANT — parallelism on 48 GPU with 32K context:
+#   Use TP=2, PP=12, CP=1, EP=2, DP=2.
+#   Math: world_size=48, DP=48/(TP×PP×CP)=48/(2×12×1)=2.
+#   EP must ≤ DP → EP=2.
+#   CP=1 keeps the full 32K context on each attention rank.
 #
 #   Layer alignment: model has 48 layers in groups of 4.
-#   PP=4 → 12 layers/stage = 3 complete groups. Boundaries are aligned. ✓
+#   PP=12 → 4 layers/stage = 1 complete group. Boundaries are aligned. ✓
 #
-# Memory note (122B BF16 + Adam, TP=2 PP=4 EP=4 DP=4):
-#   - Params bf16     ~244 GB total → ~7.6 GB/GPU (distributed across TP×PP×EP)
+# Memory note (122B BF16 + Adam, TP=2 PP=12 CP=1 EP=2 DP=2):
+#   - Params bf16     ~244 GB total → ~5.1 GB/GPU (distributed across TP×PP×EP)
 #   - Grads  bf16     same as params
-#   - Adam (m,v) fp32, ZeRO-1 → sharded across DP=4 → ~30 GB/GPU
-#   Per-GPU peak ≈ 70-78 GB on 80G GPUs — very tight.
+#   - Adam (m,v) fp32, ZeRO-1 → sharded across DP=2
+#   PP=12 reduces activation pressure for long context, but pipeline efficiency is lower.
 #
 # Container assumptions: same as run_sft_qwen35_122b_2node_lora.sh (NGC 25.06).
 #
 # Required env (per-node):
 #   MASTER_ADDR, MASTER_PORT  cluster-injected
 #   RANK or NODE_RANK         this node's index in [0, NNODES)
-#   WORLD_SIZE                number of nodes (default 4)
+#   WORLD_SIZE                number of nodes (default 6)
 #
 # Usage (run on EACH node):
-#   bash scripts/run_sft_qwen35_122b_4node.sh
+#   bash scripts/run_sft_qwen35_122b_6node.sh
 #
 # Override knobs:
-#   TP=2 PP=4 EP=8 ITERS=20 SEQ=2048 GBS=32 MBS=1 ...
+#   TP=2 PP=12 CP=1 EP=2 ITERS=20 SEQ=32768 GBS=32 MBS=1 ...
 
 set -euo pipefail
 
@@ -67,32 +67,33 @@ if [[ -z "${MCORE_PATH:-}" ]]; then
 fi
 
 TRAIN_DATA="${TRAIN_DATA:-${MEG_RUN_DIR}/demo_data/train_data_demo.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-${MEG_RUN_DIR}/qwen35_122b_full_sft}"
+OUTPUT_DIR="${OUTPUT_DIR:-${MEG_RUN_DIR}/qwen35_122b_full_sft_6node_seq32768}"
 LOG_DIR="${LOG_DIR:-${MEG_RUN_DIR}/logs}"
-LOG_FILE="${LOG_FILE:-${LOG_DIR}/sft_full_4node_$(date +%Y%m%d_%H%M%S)_rank${RANK:-0}.log}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/sft_full_6node_seq32768_$(date +%Y%m%d_%H%M%S)_rank${RANK:-0}.log}"
 
 # ---------------------------------------------------------------------------
 # Distributed config
 # ---------------------------------------------------------------------------
 NPROC="${NPROC:-8}"
-NNODES="${NNODES:-${WORLD_SIZE:-4}}"
+NNODES="${NNODES:-${WORLD_SIZE:-6}}"
 NODE_RANK="${NODE_RANK:-${RANK:-0}}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
 # ---------------------------------------------------------------------------
-# Parallelism overrides (32 GPU layout — see header for math)
+# Parallelism overrides (48 GPU / 32K layout — see header for math)
 # ---------------------------------------------------------------------------
 TP="${TP:-2}"
-PP="${PP:-4}"
-EP="${EP:-4}"
+PP="${PP:-12}"
+CP="${CP:-1}"
+EP="${EP:-2}"
 
 # ---------------------------------------------------------------------------
 # Training hyperparameters
 # ---------------------------------------------------------------------------
 RECIPE="${RECIPE:-qwen35_vl_122b_a10b_sft_config}"
 ITERS="${ITERS:-20}"
-SEQ="${SEQ:-1024}"
+SEQ="${SEQ:-32768}"
 GBS="${GBS:-32}"
 MBS="${MBS:-1}"
 DROP_OVERLENGTH="${DROP_OVERLENGTH:-False}"
@@ -161,21 +162,22 @@ OVERRIDES=(
     --step_func vlm_step
     --hf_path "$HF_MODEL"
 
-    # Parallelism (32-GPU specific override)
+    # Parallelism (48-GPU / 32K specific override)
     model.tensor_model_parallel_size="$TP"
     model.pipeline_model_parallel_size="$PP"
+    model.context_parallel_size="$CP"
     model.expert_model_parallel_size="$EP"
     model.seq_length="$SEQ"
 
     # Activation recompute (full BLOCK — every layer of every PP stage is
     # recomputed end-to-end, freeing all per-layer GDN bwd workspace as soon
-    # as the layer's bwd finishes). With PP=4 each stage has 12 layers.
+    # as the layer's bwd finishes). With PP=12 each stage has 4 layers.
     # uniform+1 (the previous setting) only recomputed in chunks of 1 layer
     # which still kept many layers' fwd activations alive at once during bwd
-    # — contributed to Pitfall #23 OOM at SEQ=1024.
+    # — contributed to Pitfall #23 OOM during earlier low-sequence bring-up.
     model.recompute_granularity=full
     model.recompute_method=block
-    model.recompute_num_layers=12
+    model.recompute_num_layers=4
 
     # Disable MTP (Multi-Token Prediction) to relieve last-pipeline-stage memory.
     # MTP adds ~1 extra transformer block + LM-head overhead only on the last PP stage,
@@ -187,9 +189,9 @@ OVERRIDES=(
     dataset.pack_sequences_in_batch=False
 
     # Optimizer CPU offload (Pitfall #28, 2026-04-26).
-    # The 122B model on 32 GPU has baseline 48 GB / 80 GB, leaving 22 GB for
-    # activations + optimizer-state lazy alloc.  But Adam's exp_avg + exp_avg_sq
-    # buffers (~30 GB total fp32 unsharded, ~7.5 GB/GPU after DP=8 sharding)
+    # The 122B model leaves limited 80G headroom for long-context activations
+    # plus optimizer-state lazy alloc.  Adam's exp_avg + exp_avg_sq
+    # buffers (~30 GB total fp32 unsharded, ~30 GB/GPU after DP=2 sharding)
     # are LAZILY allocated inside fused_adam.initialize_state on the first
     # optimizer.step().  Combined with iter-0 fwd/bwd transients
     # (~21 GB peak), the alloc crosses 80 G and OOMs.
@@ -197,7 +199,7 @@ OVERRIDES=(
     # Fix: move all Adam state to CPU.  HybridDeviceOptimizer keeps Adam
     # math on CPU (slower step but compute is small fraction of total).
     # Skill cpu-offloading: optimizer offload is the only option for PP > 1.
-    # PP=4 here, so activation offload is forbidden.
+    # PP=12 here, so activation offload is forbidden.
     #
     # Set OPTIM_OFFLOAD_FRAC=0 to disable; OPTIM_OFFLOAD_FRAC=1.0 for max savings.
     optimizer.optimizer_cpu_offload="${OPTIM_OFFLOAD:-True}"
@@ -234,7 +236,7 @@ OVERRIDES=(
 
 cat <<EOF
 ============================================================
-Qwen3.5-122B-A10B FULL SFT (4-node)
+Qwen3.5-122B-A10B FULL SFT (6-node)
   Recipe       : $RECIPE
   HF model dir : $HF_MODEL
   Mcore base   : $MCORE_PATH
@@ -242,7 +244,7 @@ Qwen3.5-122B-A10B FULL SFT (4-node)
   Output       : $OUTPUT_DIR
   Nodes/GPUs   : ${NNODES} × ${NPROC}   (this is rank ${NODE_RANK})
   Master       : ${MASTER_ADDR}:${MASTER_PORT}
-  Parallelism  : TP=${TP}  PP=${PP}  EP=${EP}
+  Parallelism  : TP=${TP}  PP=${PP}  CP=${CP}  EP=${EP}
   Iters/GBS    : ${ITERS} / ${GBS}    MBS=${MBS}
   Seq length   : ${SEQ}
   Drop long     : ${DROP_OVERLENGTH}

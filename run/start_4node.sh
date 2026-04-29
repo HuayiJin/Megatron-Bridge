@@ -5,9 +5,10 @@
 # (with patched __init__.py) + fla baked in. No runtime install needed —
 # the deps check below will find them and skip pip.
 #
-# Run on EACH of the 4 nodes (after entering the container):
+# Run on EACH node (after entering the container):
 #
 #   bash /mnt/tidal-alsh01/dataset/redone/hade/dd/start_4node.sh
+#   bash run/start_4node.sh scripts/run_sft_qwen35_122b_12node.sh
 #
 # Cluster injects MASTER_ADDR / WORLD_SIZE / RANK already.
 # If your scheduler did NOT inject RANK, prepend it manually:
@@ -24,9 +25,8 @@
 # See memory.md Pitfall #11.
 #
 # Recipe: qwen35_vl_122b_a10b_sft_config (full SFT, no LoRA).
-# Default parallelism in the launcher script is TP=2 PP=4 EP=8 (DP=2),
-# which fits 32 × L20Y 80G with full activation recompute — tight but
-# doable. Override TP/PP/EP/MBS/SEQ/ITERS/GBS via env if needed.
+# The optional first argument selects the training config script. If omitted,
+# this launcher keeps the historical 4-node full-SFT default.
 
 set -euo pipefail
 
@@ -42,6 +42,17 @@ REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 MEG_RUN_DIR="${MEG_RUN_DIR:-$(dirname "$REPO_ROOT")/meg-run}"
 WHEEL_DIR="${WHEEL_DIR:-${MEG_RUN_DIR}/wheels}"
 VENV_PY="${VENV_PY:-/opt/venv-mbridge/bin/python}"
+DEFAULT_TRAIN_SCRIPT="${REPO_ROOT}/scripts/run_sft_qwen35_122b_4node.sh"
+TRAIN_SCRIPT="${1:-${TRAIN_SCRIPT:-$DEFAULT_TRAIN_SCRIPT}}"
+
+if [[ $# -gt 1 ]]; then
+    echo "[start_4node] FATAL: expected at most one argument: TRAIN_SCRIPT" >&2
+    exit 2
+fi
+
+if [[ "$TRAIN_SCRIPT" != /* ]]; then
+    TRAIN_SCRIPT="${REPO_ROOT}/${TRAIN_SCRIPT}"
+fi
 
 CAUSAL_WHL="${CAUSAL_WHL:-${WHEEL_DIR}/causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl}"
 MAMBA_WHL="${MAMBA_WHL:-${WHEEL_DIR}/mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl}"
@@ -57,9 +68,14 @@ if [[ ! -d "$REPO_ROOT" ]]; then
     echo "[start_4node] FATAL: repo root not found: $REPO_ROOT" >&2
     exit 1
 fi
+if [[ ! -f "$TRAIN_SCRIPT" ]]; then
+    echo "[start_4node] FATAL: training script not found: $TRAIN_SCRIPT" >&2
+    exit 1
+fi
 
 cd "$REPO_ROOT"
 echo "[start_4node] node-local hostname=$(hostname)  RANK=${RANK:-?}  WORLD_SIZE=${WORLD_SIZE:-?}  MASTER=${MASTER_ADDR:-?}:${MASTER_PORT:-?}"
+echo "[start_4node] train script: $TRAIN_SCRIPT"
 
 # ---------------------------------------------------------------------------
 # 1. Install runtime-deferred deps from prebuilt wheels (idempotent)
@@ -173,7 +189,7 @@ print('[verify] triton ssd_combined import OK')
 " || { echo "[start_4node] FATAL: verification failed — runtime deps still broken" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# 4. Launch FULL SFT (4 nodes × 8 GPU = 32 GPU, TP=2 PP=4 EP=8 default)
+# 4. Launch selected FULL SFT config
 # ---------------------------------------------------------------------------
-echo "[start_4node] launching scripts/run_sft_qwen35_122b_4node.sh ..."
-exec bash "$REPO_ROOT/scripts/run_sft_qwen35_122b_4node.sh"
+echo "[start_4node] launching $TRAIN_SCRIPT ..."
+exec bash "$TRAIN_SCRIPT"
