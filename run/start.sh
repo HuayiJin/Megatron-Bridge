@@ -175,5 +175,5 @@ print('[verify] triton ssd_combined import OK')
 # ---------------------------------------------------------------------------
 # 4. Launch SFT
 # ---------------------------------------------------------------------------
-echo "[start.sh] launching scripts/run_sft_qwen35_122b_12node_hade2.sh ..."
-exec bash "$REPO_ROOT/scripts/run_sft_qwen35_122b_12node_hade2.sh"
+echo "[start.sh] launching scripts/run_sft_qwen35_122b_24node_hade.sh ..."
+exec bash "$REPO_ROOT/scripts/run_sft_qwen35_122b_24node_hade.sh"
