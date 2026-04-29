@@ -7,18 +7,18 @@
 #   default TP=2, PP=6, EP=8, LR=2e-5, GBS=36, seq=4096
 #
 # IMPORTANT — parallelism on 128 GPU with 32K context:
-#   Use TP=2, PP=4, CP=4, EP=4, DP=4.
-#   Math: world_size=128, DP=128/(TP×PP×CP)=128/(2×4×4)=4.
+#   Use TP=2, PP=4, CP=1, EP=4, DP=16.
+#   Math: world_size=128, DP=128/(TP×PP×CP)=128/(2×4×1)=16.
 #   EP must ≤ DP → EP=4.
-#   CP=4 keeps each rank's attention context shard at 8K tokens.
+#   CP=1 keeps the full 32K context on each attention rank.
 #
 #   Layer alignment: model has 48 layers in groups of 4.
 #   PP=4 → 12 layers/stage = 3 complete groups. Boundaries are aligned. ✓
 #
-# Memory note (122B BF16 + Adam, TP=2 PP=4 CP=4 EP=4 DP=4):
+# Memory note (122B BF16 + Adam, TP=2 PP=4 CP=1 EP=4 DP=16):
 #   - Params bf16     ~244 GB total → ~7.6 GB/GPU (distributed across TP×PP×EP)
 #   - Grads  bf16     same as params
-#   - Adam (m,v) fp32, ZeRO-1 → sharded across DP=4 → ~30 GB/GPU
+#   - Adam (m,v) fp32, ZeRO-1 → sharded across DP=16
 #   Per-GPU peak ≈ 70-78 GB on 80G GPUs — very tight.
 #
 # Container assumptions: same as run_sft_qwen35_122b_2node_lora.sh (NGC 25.06).
@@ -32,7 +32,7 @@
 #   bash scripts/run_sft_qwen35_122b_16node.sh
 #
 # Override knobs:
-#   TP=2 PP=4 CP=4 EP=4 ITERS=20 SEQ=32768 GBS=32 MBS=1 ...
+#   TP=2 PP=4 CP=1 EP=4 ITERS=20 SEQ=32768 GBS=32 MBS=1 ...
 
 set -euo pipefail
 
@@ -85,7 +85,7 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 # ---------------------------------------------------------------------------
 TP="${TP:-2}"
 PP="${PP:-4}"
-CP="${CP:-4}"
+CP="${CP:-1}"
 EP="${EP:-4}"
 
 # ---------------------------------------------------------------------------
