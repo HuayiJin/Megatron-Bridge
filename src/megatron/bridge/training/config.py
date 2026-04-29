@@ -1228,6 +1228,33 @@ class ConfigContainer(Container):
                     "When finetuning with CP>1, average_in_collective must be False"
                 )
 
+            # Auto-disable native fused cross-entropy under CP > 1.
+            # mcore/fusions/fused_cross_entropy.py compiles
+            #   logits_2d[arange_1d, masked_target_1d]
+            # via @jit_fuser (torch.compile / dynamo). With CP, logits are
+            # sharded along the sequence dim (len = seq_length / CP) but
+            # `target` keeps the full sequence length. Dynamo's fake-tensor
+            # broadcast check then fails with:
+            #   "Attempting to broadcast a dimension of length <SEQ> at -1!
+            #    Mismatching argument at index 1 had torch.Size([SEQ]); but
+            #    expected shape should be broadcastable to [SEQ/CP]"
+            # The 'te' fused impl is unaffected; only 'native' (jit_fuser) is.
+            # See recipes/qwen/qwen3.py:617 for the pre-existing recipe-level
+            # workaround note.
+            if (
+                getattr(self.model, "cross_entropy_loss_fusion", False)
+                and getattr(self.model, "cross_entropy_fusion_impl", "native") == "native"
+            ):
+                warn_rank_0(
+                    f"Disabling cross_entropy_loss_fusion: native fused CE "
+                    f"(jit_fuser) is incompatible with "
+                    f"context_parallel_size={self.model.context_parallel_size}. "
+                    f"Set cross_entropy_fusion_impl='te' to keep fusion on, or "
+                    f"silence this by setting cross_entropy_loss_fusion=False "
+                    f"explicitly."
+                )
+                self.model.cross_entropy_loss_fusion = False
+
         self._validate_cp_comm_type()
 
         if (

@@ -294,6 +294,26 @@ def get_batch(data_iterator: Iterable, cfg: ConfigContainer, use_mtp: bool = Fal
     is_first = is_pp_first_stage(pg_collection.pp)
     is_last = is_pp_last_stage(pg_collection.pp)
 
+    # Fail-fast: vlm_step does NOT slice labels/loss_mask along the CP dim.
+    # The generic VLM path leaves CP slicing to the model's own pre_process
+    # branch (see e.g. Qwen3VLModel.forward). That branch only runs on PP
+    # rank 0, so on the last PP stage (where the LM head + CE live) labels
+    # remain at full SEQ length while logits are sharded to SEQ/CP. CE then
+    # mis-indexes (or, with the native fused CE, dynamo aborts on a fake
+    # broadcast). For Qwen3-VL / Qwen3.5-VL use --step_func qwen3_vl_step,
+    # for LLaVA use --step_func llava_step; both call
+    # get_batch_on_this_cp_rank up-front so labels stay consistent across
+    # every PP stage. See Pitfall #24.
+    cp_size = pg_collection.cp.size() if pg_collection is not None and pg_collection.cp is not None else 1
+    if cp_size > 1:
+        raise AssertionError(
+            f"vlm_step does not perform batch-level CP slicing of labels/loss_mask, but "
+            f"context_parallel_size={cp_size} (>1). The last PP stage will see logits of "
+            f"length seq/{cp_size} and full-length labels, producing garbage loss or a "
+            f"fused-CE dynamo broadcast error. Use --step_func qwen3_vl_step (Qwen3-VL "
+            f"family) or --step_func llava_step (LLaVA) instead."
+        )
+
     # All PP stages load from iterator to get input_ids and visual grid info
     # This allows each stage to compute MRoPE position_ids locally without broadcasting
     batch = get_batch_from_iterator(

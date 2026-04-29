@@ -88,6 +88,13 @@ def _qwen35_vl_apply_common(
     # Kernel selections
     cfg.model.attention_backend = "auto"
     cfg.model.gradient_accumulation_fusion = True
+    # NOTE: native fused CE (`@jit_fuser` in mcore/fusions/fused_cross_entropy.py)
+    # is incompatible with context_parallel_size > 1 — `target` is not sharded
+    # along the sequence dim while `logits_2d` is, so dynamo's fake-tensor
+    # broadcast check fails inside calculate_predicted_logits. The training
+    # config validator (training/config.py: `if self.model.context_parallel_size
+    # > 1`) auto-disables this when CP > 1 and emits a warning, so it is safe
+    # to leave the default at True for CP=1 recipes.
     cfg.model.cross_entropy_loss_fusion = True
     cfg.model.cross_entropy_fusion_impl = "native"
 

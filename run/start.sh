@@ -27,7 +27,7 @@
 #   3. Launches LoRA SFT via scripts/run_sft_qwen35_122b_2node_lora.sh.
 
 set -euo pipefail
-
+export https_proxy=http://10.7.4.2:3128 && export HTTPS_PROXY=http://10.7.4.2:3128
 # ---------------------------------------------------------------------------
 # Path resolution
 #   REPO_ROOT  — auto-derived from this script's location (run/ subdir).
@@ -175,5 +175,5 @@ print('[verify] triton ssd_combined import OK')
 # ---------------------------------------------------------------------------
 # 4. Launch SFT
 # ---------------------------------------------------------------------------
-echo "[start.sh] launching scripts/run_sft_qwen35_122b_2node_lora.sh ..."
-exec bash "$REPO_ROOT/scripts/run_sft_qwen35_122b_2node_lora.sh"
+echo "[start.sh] launching scripts/run_sft_qwen35_122b_12node_hade2.sh ..."
+exec bash "$REPO_ROOT/scripts/run_sft_qwen35_122b_12node_hade2.sh"
