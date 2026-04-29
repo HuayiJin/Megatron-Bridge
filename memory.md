@@ -71,8 +71,8 @@
 |----------|------|------|
 | HF weights (122B) | `/mnt/tidal-alsh01/dataset/redone/checkpoints/opensource/Qwen3.5-122B-A10B` | 39 safetensors (~244 GB) |
 | Mcore checkpoint | `/mnt/tidal-alsh01/dataset/redone/hade/data/Qwen3.5-122B-A10B-mcore` | 234 GB (`iter_0000000/__0_0.distcp` + `tokenizer/` + `run_config.yaml`) |
-| Demo train JSONL | `/mnt/tidal-alsh01/dataset/redone/hade/dd/train_data_demo.jsonl` | 14 records, multi-turn text-only chat |
-| Cooked demo JSONL (text + 2 image samples) | `/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/demo_data/train_demo.jsonl` | 16 records |
+| Demo train JSONL (active) | `/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/demo_data/train_data_demo.jsonl` | **36 records**: 30 text-only + 6 multimodal (image+text); uses `conversation` passthrough format; images at `demo_img1.png` (Tensor Parallelism diagram) and `demo_img2.png` (Expert Parallelism diagram) |
+| Legacy demo JSONL (reference only) | `/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/demo_data/train_demo.jsonl` | 16 records, legacy `messages`+`images` format; not used by current scripts |
 | Output / runs / logs root | `/mnt/tidal-alsh01/dataset/redone/hade/dd/meg-run/` | per-run subdirs |
 | Megatron-Bridge source | `/mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge` | on NAS; run directly from here |
 
@@ -195,13 +195,55 @@ For VLM SFT use:
 - `--dataset vlm-preloaded` → resolves to `PreloadedVLMConversationProvider`
   (`src/megatron/bridge/data/vlm_datasets/preloaded_provider.py`)
 - Provider expects records of one of:
-  - `{"conversation": [{"role":..., "content":[{"type":"text"|"image", ...}, ...]}, ...]}` (passthrough)
+  - `{"conversation": [{"role":..., "content":[{"type":"text"|"image", "image":"/abs/path.png"}, ...]}, ...]}` **(passthrough — preferred, used by `train_data_demo.jsonl`)**
   - `{"messages": [{"role": "user", "content": "<image>\nq?"}, ...], "images": ["/abs/path.png"]}` (legacy)
   - LLaVA `{"conversations": [{"from": "human", "value": "..."}, ...]}` (legacy)
 
 `dataset.image_folder` is optional; if set, relative paths in `images` are
 resolved against it. Absolute paths and `http(s)://` / `file://` URLs are
 left alone.
+
+### Multimodal support scope (confirmed 2026-04-26)
+
+| Modality | Status | Notes |
+|----------|--------|-------|
+| Image | ✅ Fully supported | `pixel_values` + `image_grid_thw` handled in `vlm_step.py`; HF processor applied via `dataset.hf_processor_path` |
+| Video | ⚠️ Architecture ready, not yet integrated | `pixel_values_videos` / `video_grid_thw` fields defined in `GenericVisualInputs`; `qwen3_vl_step.py` has `TODO: add video support` |
+| Audio | ✖ Not used in this pipeline | `Qwen2AudioInputs` class exists but not wired to any current recipe |
+
+**Demo image assets** (both present under `meg-run/demo_data/`):
+- `demo_img1.png` — Tensor Parallelism (Intra-Layer) MLP diagram (TP=4, column/row split of W and V^T)
+- `demo_img2.png` — Expert Parallelism on MoE diagram (EP=3, one expert per GPU, All-to-All routing)
+
+## Vision Token Budget (SEQ=1024)
+
+分析基准：patch_size=14，spatial_merge_size=2（2×2合并 → token数÷4）。
+
+| 图片 | 分辨率 | patch grid | vision tokens | 文本预算 | 最长样本总计 | 状态 |
+|------|--------|-----------|--------------|---------|------------|------|
+| `demo_img1.png` | 850×476 | 61×34=2074 | **518** | 506 | ~938 | ✅ |
+| `demo_img2.png` | 960×540 | 69×39=2691 | **672** | 352 | ~839 | ✅ (精简后) |
+
+**关键约束**：图像分辨率超过约 **1400×700** 时 vision token 数将超过 SEQ=1024，无文本空间。
+
+**ViT activation 额外开销**：约 0.2 GB/sample（32层 × raw_patches × hidden=1536 × bf16），ViT 不受 LM recompute 保护，但量级可忽略。
+
+### 框架层已知缺陷（Pitfall #23 前置说明）
+
+`qwen2_5_collate_fn`（Qwen3.5-VL 使用的 collate 实现，`src/megatron/bridge/data/vlm_datasets/collate.py:158`）调用：
+
+```python
+processor.apply_chat_template(..., truncation=True)  # 无 max_length 参数
+```
+
+**未传 `max_length=seq_length`**，实际截断阈值为 tokenizer 的 `model_max_length`（~128K），导致超过 SEQ=1024 的序列**原样进入模型**，在 PP stage-0 产生 shape 不匹配或 attention OOM。
+
+原始 `train_data_demo.jsonl` 行35（`demo_img2` + 多轮长回答）预估总 token ~1092，超出 SEQ=1024 约 68 tokens。已将两个 assistant 回答精简，修复后估算 ~839 tokens（余量 185 tokens）。
+
+**数据侧规避规则（ALWAYS）**：
+- 单图像样本：文本 tokens 必须 < SEQ − vision_tokens（见上表）
+- 多图像样本：文本 tokens < SEQ − Σ vision_tokens（各图累加）
+- 高分辨率图像（>1400×700）上线前必须手动核算 token 预算
 
 ## Known Pitfalls (active for this environment)
 
@@ -229,6 +271,7 @@ left alone.
 | 20 | `FileNotFoundError: triton_poi_fused_mul_silu_1.json` on rank N during Triton JIT compilation | Root cause: `TRITON_CACHE_DIR` was pointed at a NAS path (`/mnt/...`). 32 ranks concurrently write to the same NFS directory; NFS cache-coherency delay means a rank can see the directory entry before the `.json` metadata file is visible → `FileNotFoundError`. Setting a shared NFS path for Triton cache is wrong: each rank compiles independently and caches locally by default; cross-rank sharing has no benefit and introduces NFS race conditions. **Fix (2026-04-26):** Remove `TRITON_CACHE_DIR` from `run_sft_qwen35_122b_4node.sh`; let each rank use its default local cache (`~/.triton/cache`). Do NOT set `TRITON_CACHE_DIR` to any NFS/NAS path in multi-process training. |
 | 21 | `ModuleNotFoundError: No module named 'transformer_engine'` spam from `te_distributed_compat.pth` on every container restart | Root cause: `install_runtime_deps.sh` (old step 4b) wrote `import transformer_engine.pytorch.distributed` into a venv `.pth` file. Python's `site` module processes venv `.pth` files immediately after adding that directory to `sys.path` — before `/usr/local/lib/python3.12/dist-packages` (NGC's TE location) is added. So the import always fails at `.pth` execution time. Non-fatal but causes log noise and signals broken setup; next container restart repeats the error. **Fix (2026-04-26):** (1) `install_runtime_deps.sh` step 4b now **removes** any stale `.pth` instead of creating one. (2) `scripts/training/run_recipe.py` does the import explicitly at process startup, after `sys.path` is complete. **Rule:** never use `.pth` files in venv site-packages to import packages that live in NGC system site-packages. |
 | 22 | `RuntimeError: Triton Error [CUDA]: out of memory` in `chunk_gated_delta_rule_bwd` during first backward pass | Root cause: Triton autotuner in `fla` (flash-linear-attention) `chunk_bwd_kernel_dqkwg` benchmarks all candidate configs on the **first** backward pass. Each benchmark run allocates extra temp tensors while model activations are still live (activation recompute has not freed them yet at autotuner invocation time). On 122B with TP=2 PP=4 EP=4 GBS=32 SEQ=2048 on 80G GPUs, the combined peak of activations + autotuner buffers exceeds 80G. All 8 ranks on the node OOM simultaneously. **Fix (2026-04-26):** Set `FLA_AUTOTUNE=0` in `run_sft_qwen35_122b_4node.sh`. This skips benchmarking and uses the default kernel config immediately. Throughput penalty: ~5–15% vs. a fully-tuned config — acceptable for SFT training. **Rule:** always set `FLA_AUTOTUNE=0` in multi-node training with tight VRAM budgets; let autotuning run only on isolated single-GPU profiling runs. |
+| 23 | 多模态序列超出 SEQ 长度进入模型导致 shape mismatch / OOM | **Root cause:** `qwen2_5_collate_fn`（`collate.py:158`）调用 `processor.apply_chat_template(truncation=True)` 时**未传 `max_length=seq_length`**，实际截断阈值为 tokenizer 的 `model_max_length`（~128K）。vision tokens 数量由图像分辨率决定（patch_size=14，spatial_merge=2，960×540 → 672 tokens），与文本 tokens 之和可能轻易超过 SEQ=1024，序列原样进入 PP stage-0，产生 tensor shape 不匹配或 attention 显存越界。**数据侧 Fix（2026-04-26）：** 在写入训练 JSONL 时手动控制文本长度，确保 vision_tokens + text_tokens < SEQ（见 §Vision Token Budget）。框架侧根本修复（未完成）：在 `conversation_dataset.py` 的 `_bound_collate` 中将 `target_length` 透传为 `max_length` 参数。 |
 
 ## MTP Memory Note (for future re-enablement)
 
@@ -322,7 +365,8 @@ Fresh containers have all three deps + patch ready immediately.
 | C. Pure-env image + /mnt runtime | ✅ Done (2026-04-25) | `Dockerfile.qwen35`, `scripts/install_runtime_deps.sh` |
 | D. 2-node × 8-GPU LoRA SFT demo | ⏳ Deferred (user prefers full SFT) | `scripts/run_sft_qwen35_122b_2node_lora.sh` via `start.sh` |
 | E. 4-node × 8-GPU full SFT | 🟡 In progress — OOM resolved (EP=4, MTP=0, SEQ=2048, expandable_segments, FLA_AUTOTUNE=0); TRITON_CACHE_DIR NAS race fixed | `scripts/run_sft_qwen35_122b_4node.sh` |
-| F. Real internal multimodal data | ⏳ Pending — no real images yet | needs spec |
+| F. Demo multimodal data ready | ✅ Done (2026-04-26) — `train_data_demo.jsonl` extended to 36 records (30 text + 6 image+text) using `conversation` passthrough format with `demo_img1.png` / `demo_img2.png` |
+| G. Real internal multimodal data | ⏳ Pending — no real images yet | needs spec |
 
 ## Open Questions (pending user)
 
@@ -337,4 +381,4 @@ Older bare-metal venv setup (cu128 + TE 2.7 + flash-attn 2.8.1, single-node
 H20-141G, `/data/temp/...` paths), old Dockerfile iteration history (with
 `COPY` + editable install baked in), conversion debugging — see `memory_legacy.md`.
 
-_Last updated: 2026-04-26 (Pitfall #16 uv sync --inexact; Pitfall #17 EP>DP invalid on 32GPU; Pitfall #18 install_runtime_deps on all nodes; Pitfall #19 MTP last-stage OOM; Pitfall #20 TRITON_CACHE_DIR NAS race → FileNotFoundError; Pitfall #21 te_distributed_compat.pth venv sys.path ordering → ModuleNotFoundError; Pitfall #22 FLA Triton autotuner OOM in chunk_gated_delta_rule_bwd → FLA_AUTOTUNE=0; MTP memory note added; Standard Recipes EP corrected to EP=4; Stage D deferred, Stage E in progress)_
+_Last updated: 2026-04-26 (Pitfall #16 uv sync --inexact; Pitfall #17 EP>DP invalid on 32GPU; Pitfall #18 install_runtime_deps on all nodes; Pitfall #19 MTP last-stage OOM; Pitfall #20 TRITON_CACHE_DIR NAS race → FileNotFoundError; Pitfall #21 te_distributed_compat.pth venv sys.path ordering → ModuleNotFoundError; Pitfall #22 FLA Triton autotuner OOM in chunk_gated_delta_rule_bwd → FLA_AUTOTUNE=0; Pitfall #23 multimodal seq > SEQ due to missing max_length in collate — data-side fix applied to train_data_demo.jsonl row 35; Vision Token Budget section added; MTP memory note added; Standard Recipes EP corrected to EP=4; Stage D deferred, Stage E in progress; Stage F done — train_data_demo.jsonl extended to 36 records with 6 real multimodal image+text samples in conversation passthrough format; multimodal support scope table added to Step Function section)_
