@@ -455,6 +455,59 @@ def forward_step(
         else:
             output_tensor = model(**forward_args)
 
+    # ---- model-forward-output diagnostic ----------------------------------
+    # On the last PP stage, output_tensor is what feeds the loss function.
+    # Capture a single fingerprint per call for the first few iters / on
+    # abnormality, so we can distinguish:
+    #   * NaN already inside model output  -> upstream model bug (vision/MoE/CE)
+    #   * model output OK but loss NaN     -> loss_mask * inf trap downstream
+    # Mirrors MBRIDGE_LOSS_DIAG_FIRST_N / MBRIDGE_LOSS_DIAG_VERBOSE knobs from
+    # losses.py (re-read here so this can fire even if loss_func is bypassed).
+    if is_last:
+        try:
+            import os as _os
+
+            _diag_first_n = int(_os.environ.get("MBRIDGE_LOSS_DIAG_FIRST_N", "4"))
+            _diag_verbose = _os.environ.get("MBRIDGE_LOSS_DIAG_VERBOSE", "0") == "1"
+            if not hasattr(forward_step, "_diag_call_count"):
+                forward_step._diag_call_count = 0  # type: ignore[attr-defined]
+            forward_step._diag_call_count += 1  # type: ignore[attr-defined]
+
+            ot_for_check = output_tensor[0] if isinstance(output_tensor, tuple) else output_tensor
+            if isinstance(ot_for_check, torch.Tensor):
+                ot_f = ot_for_check.detach().float()
+                n_nan = int(torch.isnan(ot_f).sum().item())
+                n_inf = int(torch.isinf(ot_f).sum().item())
+                abnormal = n_nan > 0 or n_inf > 0
+                if abnormal or forward_step._diag_call_count <= _diag_first_n or _diag_verbose:  # type: ignore[attr-defined]
+                    rk = (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_available() and torch.distributed.is_initialized()
+                        else -1
+                    )
+                    finite = torch.isfinite(ot_f)
+                    n_finite = int(finite.sum().item())
+                    if n_finite > 0:
+                        ot_finite = ot_f[finite]
+                        fmin = ot_finite.min().item()
+                        fmax = ot_finite.max().item()
+                        fmean = ot_finite.mean().item()
+                    else:
+                        fmin = fmax = fmean = float("nan")
+                    tag = "ABNORMAL" if abnormal else "ok"
+                    print(
+                        f"[fwd-diag] rank{rk:03d} call#{forward_step._diag_call_count} {tag} "  # type: ignore[attr-defined]
+                        f"output_tensor: shape={tuple(ot_for_check.shape)} "
+                        f"dtype={ot_for_check.dtype} "
+                        f"n_nan={n_nan} n_inf={n_inf} n_finite={n_finite} "
+                        f"min={fmin:.4g} max={fmax:.4g} mean={fmean:.4g} "
+                        f"output_was_tuple={isinstance(output_tensor, tuple)}",
+                        flush=True,
+                    )
+        except Exception as _e:  # noqa: BLE001 — diagnostic, never raise
+            print(f"[fwd-diag] fingerprint failed: {type(_e).__name__}: {_e}", flush=True)
+    # -----------------------------------------------------------------------
+
     loss_function = _create_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
 
     return output_tensor, loss_function
