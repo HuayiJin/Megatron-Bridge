@@ -266,4 +266,5 @@ sys.exit(0 if ok else 1)
 PYEOF
 
 echo "[install_runtime_deps] all done — container is ready to run training."
-echo "  Next: RANK=<N> MASTER_PORT=23456 bash run/start_4node.sh"
+echo "  Next: start Ray on every node with: bash run/start_ray.sh"
+echo "        then run on rank 0: /opt/venv-mbridge/bin/python run/run_on_all_nodes.py <TRAIN_SCRIPT>"

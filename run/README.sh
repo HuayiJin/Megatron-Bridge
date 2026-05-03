@@ -17,9 +17,9 @@ export WHEEL_DIR="${MEG_RUN_DIR}/wheels"
 export https_proxy=http://10.7.4.2:3128
 export HTTPS_PROXY=http://10.7.4.2:3128
 
-# 3. 安装运行时依赖
+# 3. 每个 node/container 上启动或加入 Ray 集群
 cd /mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge
-bash scripts/install_runtime_deps.sh
+bash run/start_ray.sh
 
-# 4. 执行
-bash run/start_4node.sh
+# 4. Ray 集群 ready 后，只在 rank 0 上下发训练任务
+/opt/venv-mbridge/bin/python run/run_on_all_nodes.py scripts/run_sft_qwen35_122b_24node_hade.sh

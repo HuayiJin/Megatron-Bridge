@@ -9,8 +9,8 @@
 # is done by the operator AFTER the container starts, from the /mnt source tree:
 #
 #   cd /mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge
-#   bash scripts/install_runtime_deps.sh
-#   RANK=<N> MASTER_PORT=23456 bash /mnt/tidal-alsh01/dataset/redone/hade/dd/start.sh
+#   bash run/start_ray.sh                         # on every node
+#   /opt/venv-mbridge/bin/python run/run_on_all_nodes.py <TRAIN_SCRIPT>  # on rank 0
 
 set -e
 
