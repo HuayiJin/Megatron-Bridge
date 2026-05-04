@@ -90,6 +90,11 @@ ITERS="${ITERS:-10}"            # short demo run
 SEQ="${SEQ:-2048}"              # 2048 for fast demo; recipe default is 4096
 GBS="${GBS:-16}"                # global batch size
 MBS="${MBS:-1}"                 # micro batch size
+DROP_OVERLENGTH="${DROP_OVERLENGTH:-False}"
+VALID_SPLIT_RATIO="${VALID_SPLIT_RATIO:-0.05}"
+VALID_SPLIT_SEED="${VALID_SPLIT_SEED:-1234}"
+EVAL_ITERS="${EVAL_ITERS:-1}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-1000000}"
 LOG_INTERVAL="${LOG_INTERVAL:-1}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-1000000}"   # don't save during demo
 
@@ -166,6 +171,7 @@ OVERRIDES=(
     --hf_path "$HF_MODEL"
 
     # Parallelism: the LoRA recipe defaults are TP=2 PP=1 EP=8 (16 GPU). Keep them.
+    model.seq_length="$SEQ"
 
     # GDN constraint — never enable sequence packing on Qwen3.5-VL with linear-attn.
     dataset.pack_sequences_in_batch=False
@@ -174,8 +180,8 @@ OVERRIDES=(
     train.train_iters="$ITERS"
     train.global_batch_size="$GBS"
     train.micro_batch_size="$MBS"
-    train.eval_iters=0
-    train.eval_interval=1000000
+    validation.eval_iters="$EVAL_ITERS"
+    validation.eval_interval="$EVAL_INTERVAL"
 
     # Checkpoint: load mcore base, do not save during demo
     checkpoint.pretrained_checkpoint="$MCORE_PATH"
@@ -187,6 +193,9 @@ OVERRIDES=(
     dataset.train_data_path="$TRAIN_DATA"
     dataset.hf_processor_path="$HF_MODEL"
     dataset.seq_length="$SEQ"
+    dataset.drop_overlength_samples="$DROP_OVERLENGTH"
+    dataset.validation_split_ratio="$VALID_SPLIT_RATIO"
+    dataset.validation_split_seed="$VALID_SPLIT_SEED"
 
     # Logging
     logger.log_interval="$LOG_INTERVAL"
@@ -209,6 +218,9 @@ Qwen3.5-122B-A10B LoRA SFT (2-node demo)
   Master       : ${MASTER_ADDR}:${MASTER_PORT}
   Iters/GBS    : ${ITERS} / ${GBS}
   Seq length   : ${SEQ}
+  Drop long     : ${DROP_OVERLENGTH}
+  Valid split  : ${VALID_SPLIT_RATIO}
+  Eval         : every ${EVAL_INTERVAL}, iters=${EVAL_ITERS}
   Log file     : $LOG_FILE
   Venv python  : $VENV_PY
 ============================================================

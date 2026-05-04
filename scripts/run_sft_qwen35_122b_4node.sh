@@ -95,6 +95,11 @@ ITERS="${ITERS:-20}"
 SEQ="${SEQ:-1024}"
 GBS="${GBS:-32}"
 MBS="${MBS:-1}"
+DROP_OVERLENGTH="${DROP_OVERLENGTH:-False}"
+VALID_SPLIT_RATIO="${VALID_SPLIT_RATIO:-0.05}"
+VALID_SPLIT_SEED="${VALID_SPLIT_SEED:-1234}"
+EVAL_ITERS="${EVAL_ITERS:-1}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-1000000}"
 LOG_INTERVAL="${LOG_INTERVAL:-1}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-500}"
 
@@ -160,6 +165,7 @@ OVERRIDES=(
     model.tensor_model_parallel_size="$TP"
     model.pipeline_model_parallel_size="$PP"
     model.expert_model_parallel_size="$EP"
+    model.seq_length="$SEQ"
 
     # Activation recompute (full BLOCK — every layer of every PP stage is
     # recomputed end-to-end, freeing all per-layer GDN bwd workspace as soon
@@ -203,8 +209,8 @@ OVERRIDES=(
     train.train_iters="$ITERS"
     train.global_batch_size="$GBS"
     train.micro_batch_size="$MBS"
-    train.eval_iters=0
-    train.eval_interval=1000000
+    validation.eval_iters="$EVAL_ITERS"
+    validation.eval_interval="$EVAL_INTERVAL"
 
     # Checkpoint
     checkpoint.pretrained_checkpoint="$MCORE_PATH"
@@ -216,6 +222,9 @@ OVERRIDES=(
     dataset.train_data_path="$TRAIN_DATA"
     dataset.hf_processor_path="$HF_MODEL"
     dataset.seq_length="$SEQ"
+    dataset.drop_overlength_samples="$DROP_OVERLENGTH"
+    dataset.validation_split_ratio="$VALID_SPLIT_RATIO"
+    dataset.validation_split_seed="$VALID_SPLIT_SEED"
 
     # Logging
     logger.log_interval="$LOG_INTERVAL"
@@ -236,6 +245,9 @@ Qwen3.5-122B-A10B FULL SFT (4-node)
   Parallelism  : TP=${TP}  PP=${PP}  EP=${EP}
   Iters/GBS    : ${ITERS} / ${GBS}    MBS=${MBS}
   Seq length   : ${SEQ}
+  Drop long     : ${DROP_OVERLENGTH}
+  Valid split  : ${VALID_SPLIT_RATIO}
+  Eval         : every ${EVAL_INTERVAL}, iters=${EVAL_ITERS}
   Log file     : $LOG_FILE
   Venv python  : $VENV_PY
 ============================================================

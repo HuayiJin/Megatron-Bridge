@@ -51,6 +51,27 @@ def _resolve_path(path: str | Path) -> str:
     return str(candidate.resolve())
 
 
+def _parse_env_assignment(assignment: str) -> tuple[str, str]:
+    if "=" not in assignment:
+        raise argparse.ArgumentTypeError(f"expected KEY=VALUE, got: {assignment}")
+    key, value = assignment.split("=", 1)
+    if not key:
+        raise argparse.ArgumentTypeError(f"empty env key in: {assignment}")
+    return key, value
+
+
+def _load_env_file(path: str) -> dict[str, str]:
+    env: dict[str, str] = {}
+    with open(path, encoding="utf-8") as file:
+        for line_no, raw_line in enumerate(file, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, value = _parse_env_assignment(line)
+            env[key] = value
+    return env
+
+
 @ray.remote
 def run_train_script(train_script: str, injected_env: dict[str, str]) -> dict[str, str]:
     """Run the selected training script on one Ray node."""
@@ -208,6 +229,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Skip the default cleanup step before launching the training script.",
     )
+    parser.add_argument(
+        "--env",
+        action="append",
+        type=_parse_env_assignment,
+        default=[],
+        metavar="KEY=VALUE",
+        help="Environment variable injected into every node. Can be repeated.",
+    )
+    parser.add_argument(
+        "--env-file",
+        action="append",
+        default=[],
+        help="File with KEY=VALUE lines to inject into every node. Later files/--env override earlier values.",
+    )
+    parser.add_argument(
+        "--pass-env",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="Copy an environment variable from this rank-0 process into every node. Can be repeated.",
+    )
     return parser.parse_args(argv)
 
 
@@ -227,6 +269,16 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("training script not found: %s", train_script)
             return 2
 
+        user_env: dict[str, str] = {}
+        for env_file in args.env_file:
+            user_env.update(_load_env_file(env_file))
+        for key in args.pass_env:
+            if key in os.environ:
+                user_env[key] = os.environ[key]
+            else:
+                logger.warning("--pass-env %s ignored because it is not set in the driver environment", key)
+        user_env.update(dict(args.env))
+
         master_addr = args.master_addr or _node_ip(alive_nodes[0])
         ordered_nodes = _ordered_nodes(alive_nodes, master_addr)
         world_size = len(ordered_nodes)
@@ -242,6 +294,7 @@ def main(argv: list[str] | None = None) -> int:
         for node_rank, node in enumerate(ordered_nodes):
             node_ip = _node_ip(node)
             injected_env = {
+                **user_env,
                 "REPO_ROOT": str(REPO_ROOT),
                 "RANK": str(node_rank),
                 "NODE_RANK": str(node_rank),
