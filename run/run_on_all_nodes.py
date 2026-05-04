@@ -303,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
                 "MASTER_ADDR": master_addr,
                 "MASTER_PORT": str(args.master_port),
             }
+            if node_rank == 0:
+                logger.info(f"{injected_env=}")
             future = run_train_script.options(resources={f"node:{node_ip}": 0.01}).remote(
                 train_script,
                 injected_env,
