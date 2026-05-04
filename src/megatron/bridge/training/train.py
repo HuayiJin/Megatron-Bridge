@@ -14,7 +14,9 @@
 
 import gc
 import inspect
+import logging
 import os
+import socket
 import sys
 import time
 from collections import deque
@@ -98,6 +100,38 @@ from megatron.bridge.training.utils.train_utils import (
     training_log,
 )
 from megatron.bridge.utils.common_utils import get_world_size_safe, print_rank_0
+
+
+logger = logging.getLogger(__name__)
+
+
+def _log_train_debug_stage(stage: str, iteration: int) -> None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    else:
+        rank = int(os.environ.get("RANK", "-1"))
+
+    cuda_device = None
+    memory_allocated_gb = 0.0
+    memory_reserved_gb = 0.0
+    if torch.cuda.is_available():
+        cuda_device = torch.cuda.current_device()
+        memory_allocated_gb = torch.cuda.memory_allocated() / 1024**3
+        memory_reserved_gb = torch.cuda.memory_reserved() / 1024**3
+
+    logger.info(
+        "[train-debug] stage=%s iteration=%s rank=%s local_rank=%s node_rank=%s host=%s cuda_device=%s "
+        "memory_allocated_gb=%.2f memory_reserved_gb=%.2f",
+        stage,
+        iteration,
+        rank,
+        os.environ.get("LOCAL_RANK", "unknown"),
+        os.environ.get("NODE_RANK", os.environ.get("GROUP_RANK", "unknown")),
+        socket.gethostname(),
+        cuda_device,
+        memory_allocated_gb,
+        memory_reserved_gb,
+    )
 
 
 def train(
@@ -297,6 +331,7 @@ def train(
 
     start_iteration = global_state.train_state.step
     print_rank_0(f"Starting training loop at iteration {start_iteration}")
+    _log_train_debug_stage("training-loop-start", start_iteration)
     num_floating_point_operations_model = flop_utils.num_floating_point_operations(config, batch_size=1)
     p2p_communicator = P2PCommunicator(pp_group=pg_collection.pp, config=model_config)
     dp_size = pg_collection.dp.size()
@@ -417,6 +452,9 @@ def train(
                 ),
             )
 
+        if global_state.train_state.step == start_iteration:
+            _log_train_debug_stage("before-first-train-step", global_state.train_state.step)
+
         (
             loss_dict,
             skipped_iter,
@@ -437,6 +475,9 @@ def train(
             forward_backward_func,
             p2p_communicator,
         )
+
+        if global_state.train_state.step == start_iteration:
+            _log_train_debug_stage("after-first-train-step", global_state.train_state.step)
 
         fault_tolerance.on_training_step_end(global_state)
 
@@ -770,6 +811,10 @@ def train_step(
     model_config = get_model_config(model[0])
     train_config = cfg.train
     optim_config = cfg.optimizer
+    debug_first_iteration = global_state.train_state.step == 0
+
+    if debug_first_iteration:
+        _log_train_debug_stage("train-step-enter", global_state.train_state.step)
 
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
@@ -822,6 +867,8 @@ def train_step(
             adjust_tensor_shapes_fn = None
 
         # Forward pass.
+        if debug_first_iteration:
+            _log_train_debug_stage("before-forward-backward", global_state.train_state.step)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=forward_backward_data_iterator,
@@ -835,6 +882,8 @@ def train_step(
             p2p_communicator=p2p_communicator,
             pg_collection=pg_collection,
         )
+        if debug_first_iteration:
+            _log_train_debug_stage("after-forward-backward", global_state.train_state.step)
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None, None
@@ -845,7 +894,11 @@ def train_step(
 
     # Update parameters.
     timers("optimizer", log_level=1).start(barrier=optim_config.barrier_with_L1_time)
+    if debug_first_iteration:
+        _log_train_debug_stage("before-optimizer-step", global_state.train_state.step)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if debug_first_iteration:
+        _log_train_debug_stage("after-optimizer-step", global_state.train_state.step)
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step

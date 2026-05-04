@@ -92,7 +92,7 @@ EP="${EP:-4}"
 # Training hyperparameters
 # ---------------------------------------------------------------------------
 RECIPE="${RECIPE:-qwen35_vl_122b_a10b_sft_config}"
-ITERS="${ITERS:-20}"
+ITERS="${ITERS:-30}"
 SEQ="${SEQ:-32768}"
 GBS="${GBS:-32}"
 MBS="${MBS:-1}"
@@ -189,7 +189,7 @@ OVERRIDES=(
     model.context_parallel_size="$CP"
     model.expert_model_parallel_size="$EP"
     model.seq_length="$SEQ"
-    dist.distributed_timeout_minutes="${DIST_TIMEOUT_MINUTES:-20}"
+    dist.distributed_timeout_minutes="${DIST_TIMEOUT_MINUTES:-30}"
 
     # Activation recompute (full BLOCK — every layer of every PP stage is
     # recomputed end-to-end, freeing all per-layer GDN bwd workspace as soon
@@ -206,6 +206,10 @@ OVERRIDES=(
     # causing rank3 OOM while rank0-2 are fine. MTP is for inference throughput, not
     # needed for SFT training correctness.
     model.mtp_num_layers=0
+
+    # Vision memory: keep frozen for 96K SFT.
+    model.freeze_vision_model=True
+    model.freeze_vision_projection=True
 
     # CP > 1 required flags (config.py:1224-1228).
     # calculate_per_token_loss=True: avoids NaN loss on CP ranks whose

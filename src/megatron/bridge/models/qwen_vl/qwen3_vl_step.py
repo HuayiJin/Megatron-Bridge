@@ -13,6 +13,8 @@
 # limitations under the License.
 import logging
 import math
+import os
+import socket
 from functools import partial
 from typing import Any, Iterable
 
@@ -33,9 +35,90 @@ from megatron.bridge.training.utils.padding_utils import (
     pad_or_truncate_pos_to_len,
 )
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
+from megatron.bridge.utils.common_utils import print_rank_0
 
 
 logger = logging.getLogger(__name__)
+
+_G_LOGGED_FIRST_BATCH_FETCH = False
+
+
+def _summarize_batch_for_debug(batch: dict[str, Any]) -> str:
+    summaries: list[str] = []
+    for key in sorted(batch.keys()):
+        value = batch[key]
+        if isinstance(value, torch.Tensor):
+            summaries.append(f"{key}=Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device})")
+        elif value is None:
+            summaries.append(f"{key}=None")
+        elif hasattr(value, "__dict__"):
+            fields = []
+            for field_name, field_value in sorted(value.__dict__.items()):
+                if isinstance(field_value, torch.Tensor):
+                    fields.append(f"{field_name}:shape={tuple(field_value.shape)},dtype={field_value.dtype}")
+                elif field_value is not None:
+                    fields.append(f"{field_name}:{type(field_value).__name__}")
+            summaries.append(f"{key}={type(value).__name__}({', '.join(fields)})")
+        else:
+            summaries.append(f"{key}={type(value).__name__}")
+    return "; ".join(summaries)
+
+
+def _log_qwen3_vl_debug(stage: str, batch: dict[str, Any] | None = None) -> None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    else:
+        rank = int(os.environ.get("RANK", "-1"))
+
+    cuda_device = None
+    memory_allocated_gb = 0.0
+    memory_reserved_gb = 0.0
+    if torch.cuda.is_available():
+        cuda_device = torch.cuda.current_device()
+        memory_allocated_gb = torch.cuda.memory_allocated() / 1024**3
+        memory_reserved_gb = torch.cuda.memory_reserved() / 1024**3
+
+    batch_summary = _summarize_batch_for_debug(batch) if batch is not None else ""
+    logger.info(
+        "[qwen3-vl-debug] stage=%s rank=%s local_rank=%s node_rank=%s host=%s cuda_device=%s "
+        "memory_allocated_gb=%.2f memory_reserved_gb=%.2f batch=%s",
+        stage,
+        rank,
+        os.environ.get("LOCAL_RANK", "unknown"),
+        os.environ.get("NODE_RANK", os.environ.get("GROUP_RANK", "unknown")),
+        socket.gethostname(),
+        cuda_device,
+        memory_allocated_gb,
+        memory_reserved_gb,
+        batch_summary,
+    )
+
+
+def _get_sample_seq_lens_for_log(batch: dict[str, Any]) -> list[int]:
+    attention_mask = batch.get("attention_mask")
+    if isinstance(attention_mask, torch.Tensor):
+        return attention_mask.reshape(attention_mask.shape[0], -1).sum(dim=1).to(torch.int64).cpu().tolist()
+
+    input_ids = batch.get("input_ids")
+    if input_ids is None:
+        input_ids = batch.get("tokens")
+    if isinstance(input_ids, torch.Tensor):
+        return [int(input_ids.shape[1])] * int(input_ids.shape[0])
+    return []
+
+
+def _print_sample_padding_truncation(sample_seq_lens: list[int], target_len: int, iteration: int) -> None:
+    for sample_idx, sample_len in enumerate(sample_seq_lens):
+        if sample_len < target_len:
+            print_rank_0(
+                f"[qwen3-vl-sample-length] iteration={iteration} sample_idx={sample_idx} "
+                f"input_length={sample_len} target_length={target_len} padding_length={target_len - sample_len}"
+            )
+        elif sample_len > target_len:
+            print_rank_0(
+                f"[qwen3-vl-sample-length] iteration={iteration} sample_idx={sample_idx} "
+                f"input_length={sample_len} target_length={target_len} truncation_length={sample_len - target_len}"
+            )
 
 
 def get_batch_from_iterator(
@@ -56,7 +139,16 @@ def get_batch_from_iterator(
     Returns:
         dict[str, torch.Tensor]: A dictionary containing the batch data.
     """
+    global _G_LOGGED_FIRST_BATCH_FETCH
+
+    should_log_batch_fetch = not _G_LOGGED_FIRST_BATCH_FETCH
+    if should_log_batch_fetch:
+        _log_qwen3_vl_debug("before-first-next-data-iterator")
     batch = next(data_iterator)
+    sample_seq_lens = _get_sample_seq_lens_for_log(batch)
+    if should_log_batch_fetch:
+        _log_qwen3_vl_debug("after-first-next-data-iterator", batch)
+        _G_LOGGED_FIRST_BATCH_FETCH = True
 
     required_device_keys = set()
     required_host_keys = set()
@@ -94,6 +186,8 @@ def get_batch_from_iterator(
         else:
             _batch_required_keys[key] = None
 
+    _batch_required_keys["sample_seq_lens"] = sample_seq_lens
+
     return _batch_required_keys
 
 
@@ -111,6 +205,7 @@ def get_batch(
     torch.Tensor,
     torch.Tensor,
     Any,
+    list[int],
 ]:
     """Generate a batch.
 
@@ -148,6 +243,7 @@ def get_batch(
         batch.get("attention_mask"),
         batch.get("position_ids"),
         multi_modal_inputs,
+        batch.get("sample_seq_lens", []),
     )
 
 
@@ -234,6 +330,8 @@ def forward_step(
     config = get_model_config(model)
     use_mtp = (getattr(config, "mtp_num_layers", None) or 0) > 0
 
+    if state.train_state.step == 0:
+        _log_qwen3_vl_debug("forward-step-enter")
     timers("batch-generator", log_level=2).start()
     with straggler_timer(bdata=True):
         (
@@ -243,12 +341,23 @@ def forward_step(
             attention_mask,
             position_ids,
             multi_modal_inputs,
+            sample_seq_lens,
         ) = get_batch(data_iterator, state.cfg, use_mtp, is_first_pp_stage=is_first, is_last_pp_stage=is_last)
     timers("batch-generator").stop()
+    if state.train_state.step == 0:
+        _log_qwen3_vl_debug("after-get-batch")
 
     # To be compatible with qwen3vl, we move the sequence padding and packing to forward_step function.
     # Qwen3VL model need the original input and do cp and sp split in model.forward.
     pack_sequences_in_batch = getattr(state.cfg.dataset, "pack_sequences_in_batch", False)
+    tp_size = this_pg_collection.tp.size()
+    cp_size = this_pg_collection.cp.size()
+    divisible_by = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    divisible_by = math.lcm(divisible_by, 16)
+    target_len = math.ceil(tokens.shape[1] / divisible_by) * divisible_by
+    if this_pg_collection.pp.size() > 1 or this_pg_collection.ep.size() > 1:
+        target_len = config.seq_length
+    _print_sample_padding_truncation(sample_seq_lens, target_len, state.train_state.step)
 
     tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = pack_or_pad_batch_sequences(
         tokens,
@@ -261,6 +370,17 @@ def forward_step(
         force_to_pad_to_seq_len=this_pg_collection.pp.size() > 1 or this_pg_collection.ep.size() > 1,
         seq_length=config.seq_length,
     )
+    if state.train_state.step == 0:
+        _log_qwen3_vl_debug(
+            "after-pack-or-pad",
+            {
+                "tokens": tokens,
+                "labels": labels,
+                "loss_mask": loss_mask,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+        )
     forward_args = {
         "input_ids": tokens,
         "labels": labels,
@@ -314,7 +434,11 @@ def forward_step(
             loss_function = _create_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
             return schedule_plan, loss_function
         else:
+            if state.train_state.step == 0:
+                _log_qwen3_vl_debug("before-model-forward")
             output_tensor = model(**forward_args)
+            if state.train_state.step == 0:
+                _log_qwen3_vl_debug("after-model-forward")
 
     loss_function = _create_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
 

@@ -28,6 +28,76 @@ from transformers import AutoProcessor
 from megatron.bridge.data.vlm_datasets.conversation_dataset import VLMConversationDataset
 from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
 from megatron.bridge.training.config import DatasetBuildContext, DatasetProvider
+from megatron.bridge.utils.common_utils import print_rank_0
+
+
+_LOG_PREVIEW_CHARS = 160
+_LOG_MAX_CONTENT_PARTS = 4
+
+
+def _preview_for_log(value: Any) -> str:
+    text = repr(value)
+    if len(text) <= _LOG_PREVIEW_CHARS:
+        return text
+    return f"{text[:_LOG_PREVIEW_CHARS]}..."
+
+
+def _summarize_field_for_log(record: Dict[str, Any], field_name: str) -> str:
+    if field_name not in record:
+        return "missing"
+
+    value = record[field_name]
+    if isinstance(value, list):
+        first = _preview_for_log(value[0]) if value else "None"
+        return f"list(len={len(value)}, first={first})"
+    return f"{type(value).__name__}({_preview_for_log(value)})"
+
+
+def _summarize_content_part_for_log(part: Dict[str, Any]) -> str:
+    part_type = part.get("type", "unknown")
+    if part_type == "text":
+        return f"text={_preview_for_log(part.get('text', ''))}"
+    if part_type in ("image", "video"):
+        return f"{part_type}={_preview_for_log(part.get(part_type))}"
+    return f"{part_type} keys={sorted(part.keys())}"
+
+
+def _summarize_conversation_for_log(conversation: List[Dict[str, Any]]) -> str:
+    turns: List[str] = []
+    for turn in conversation[:2]:
+        content = turn.get("content", [])
+        if isinstance(content, list):
+            parts = [_summarize_content_part_for_log(part) for part in content[:_LOG_MAX_CONTENT_PARTS]]
+            if len(content) > _LOG_MAX_CONTENT_PARTS:
+                parts.append(f"...+{len(content) - _LOG_MAX_CONTENT_PARTS} parts")
+            content_summary = ", ".join(parts)
+        else:
+            content_summary = _preview_for_log(content)
+        turns.append(f"role={turn.get('role')}, content=[{content_summary}]")
+    if len(conversation) > 2:
+        turns.append(f"...+{len(conversation) - 2} turns")
+    return "; ".join(turns)
+
+
+def _conversation_stats_for_log(conversation: List[Dict[str, Any]]) -> Tuple[int, int]:
+    text_length = 0
+    image_count = 0
+    for turn in conversation:
+        content = turn.get("content", [])
+        if isinstance(content, str):
+            text_length += len(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "text":
+                text_length += len(part.get("text", ""))
+            elif part_type == "image":
+                image_count += 1
+    return text_length, image_count
 
 
 def _split_text_by_placeholders(
@@ -211,15 +281,46 @@ class PreloadedVLMConversationProvider(DatasetProvider):
         if not split_path or target_length <= 0:
             return None
         raw_examples = _load_preloaded_examples(split_path)
+        print_rank_0(
+            f"Loading preloaded VLM dataset from {split_path}: "
+            f"raw_examples={len(raw_examples)}, target_length={target_length}, image_folder={self.image_folder}"
+        )
         base_examples: List[Dict[str, Any]] = []
+        logged_sample = False
+        total_text_length = 0
+        max_text_length = 0
+        total_image_count = 0
+        max_image_count = 0
         for rec in raw_examples:
             conv = _record_to_conversation(rec, self.image_folder)
             if conv is None:
                 continue
+            text_length, image_count = _conversation_stats_for_log(conv)
+            total_text_length += text_length
+            max_text_length = max(max_text_length, text_length)
+            total_image_count += image_count
+            max_image_count = max(max_image_count, image_count)
+            if not logged_sample:
+                print_rank_0(
+                    "Preloaded VLM raw sample fields: "
+                    f"keys={sorted(rec.keys())}, "
+                    f"image={_summarize_field_for_log(rec, 'image')}, "
+                    f"images={_summarize_field_for_log(rec, 'images')}, "
+                    f"videos={_summarize_field_for_log(rec, 'videos')}"
+                )
+                print_rank_0(f"Preloaded VLM parsed sample: {_summarize_conversation_for_log(conv)}")
+                logged_sample = True
             base_examples.append({"conversation": conv})
         if not base_examples:
             logging.warning(f"No usable examples parsed from {split_path}")
             return None
+        print_rank_0(
+            f"Parsed {len(base_examples)} usable preloaded VLM examples from {split_path}: "
+            f"avg_text_length={total_text_length / len(base_examples):.1f}, "
+            f"max_text_length={max_text_length}, "
+            f"avg_image_count={total_image_count / len(base_examples):.2f}, "
+            f"max_image_count={max_image_count}"
+        )
         return VLMConversationDataset(
             base_examples=base_examples,
             target_length=target_length,

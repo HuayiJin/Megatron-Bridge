@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_SCRIPT = REPO_ROOT / "scripts" / "run_sft_qwen35_122b_24node_hade.sh"
 DEFAULT_MASTER_PORT = "23456"
+RANK_ENV_KEYS = ("RANK", "NODE_RANK", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK")
 
 
 def _resolve_path(path: str | Path) -> str:
@@ -70,6 +71,18 @@ def _load_env_file(path: str) -> dict[str, str]:
             key, value = _parse_env_assignment(line)
             env[key] = value
     return env
+
+
+def _current_rank() -> tuple[str, int] | None:
+    for key in RANK_ENV_KEYS:
+        value = os.environ.get(key)
+        if value is None:
+            continue
+        try:
+            return key, int(value)
+        except ValueError:
+            logger.warning("Ignoring non-integer %s=%r when checking rank-0 guard", key, value)
+    return None
 
 
 @ray.remote
@@ -256,6 +269,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args(sys.argv[1:] if argv is None else argv)
+
+    rank_info = _current_rank()
+    if rank_info is not None:
+        rank_key, rank = rank_info
+        if rank != 0:
+            logger.info("Skipping run_on_all_nodes.py because %s=%d; only rank 0 may execute it", rank_key, rank)
+            return 0
 
     ray.init(address="auto")
     try:

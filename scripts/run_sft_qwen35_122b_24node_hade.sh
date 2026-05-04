@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
-# Qwen3.5-122B-A10B FULL SFT — 24 nodes × 8 GPU, 96K context.
-# Keep the memory-saving settings below unless there is new measured headroom:
+# Qwen3.5-122B-A10B FULL SFT — 24 nodes × 8 GPU (= 192 × H800 80G).
+#
+# This script intentionally stays aligned with the 12-node bring-up script and
+# only scales the target context to 64K.  The extra nodes are used as CP=2 so
+# each attention rank sees the same 32K local context as the 12-node baseline.
+#
+# Parallelism on 192 GPU with 64K context:
+#   Use TP=2, PP=12, CP=2, EP=4, DP=4.
+#   Math: world_size=192, DP=192/(TP×PP×CP)=192/(2×12×2)=4.
+#   EP must ≤ DP → EP=4.
+#   CP=2 shards the 64K context to 32K per attention rank.
+#
+# Keep the same memory-saving settings as the 12-node baseline:
 #   - freeze vision encoder/projection
-#   - TE chunked cross entropy
-#   - full uniform activation recompute with num_layers=1
+#   - full block activation recompute with num_layers=4
 #   - optimizer CPU offload
 #   - MTP disabled
+#   - fused cross entropy disabled under CP
 #   - FLA autotune disabled
 
 set -euo pipefail
@@ -17,17 +28,19 @@ MEG_RUN_DIR="${MEG_RUN_DIR:-$(dirname "$REPO_ROOT")/meg-run}"
 
 if [[ -z "${HF_MODEL:-}" ]]; then
     echo "[ERROR] HF_MODEL is not set. Export the path to your HF model directory." >&2
+    echo "  export HF_MODEL=/path/to/Qwen3.5-122B-A10B" >&2
     exit 1
 fi
 if [[ -z "${MCORE_PATH:-}" ]]; then
     echo "[ERROR] MCORE_PATH is not set. Export the path to your Megatron-Core checkpoint." >&2
+    echo "  export MCORE_PATH=/path/to/Qwen3.5-122B-A10B-mcore" >&2
     exit 1
 fi
 
 TRAIN_DATA="${TRAIN_DATA:-${MEG_RUN_DIR}/demo_data/train_data_demo.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-${MEG_RUN_DIR}/qwen35_122b_full_sft_24node_seq98304}"
-LOG_DIR="${LOG_DIR:-${MEG_RUN_DIR}/logs}"
-LOG_FILE="${LOG_FILE:-${LOG_DIR}/sft_full_24node_seq98304_$(date +%Y%m%d_%H%M%S)_rank${RANK:-0}.log}"
+OUTPUT_DIR="${OUTPUT_DIR:-${MEG_RUN_DIR}/qwen35_122b_full_sft_24node_seq65536}"
+LOG_DIR="${LOG_DIR:-${MEG_RUN_DIR}/logs192}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/sft_full_24node_seq65536_$(date +%Y%m%d_%H%M)_rank${RANK:-0}.log}"
 
 NPROC="${NPROC:-8}"
 NNODES="${NNODES:-${WORLD_SIZE:-24}}"
@@ -37,19 +50,14 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 
 TP="${TP:-2}"
 PP="${PP:-12}"
-CP="${CP:-1}"
+CP="${CP:-2}"
 EP="${EP:-4}"
 
 RECIPE="${RECIPE:-qwen35_vl_122b_a10b_sft_config}"
-ITERS="${ITERS:-20}"
-SEQ="${SEQ:-98304}"
+ITERS="${ITERS:-100}"
+SEQ="${SEQ:-65536}"
 GBS="${GBS:-32}"
 MBS="${MBS:-1}"
-LR="${LR:-}"
-LR_WARMUP_ITERS="${LR_WARMUP_ITERS:-}"
-MOE_AUX_LOSS_COEFF="${MOE_AUX_LOSS_COEFF:-}"
-MOE_Z_LOSS_COEFF="${MOE_Z_LOSS_COEFF:-1e-3}"
-DROP_OVERLENGTH="${DROP_OVERLENGTH:-False}"
 VALID_SPLIT_RATIO="${VALID_SPLIT_RATIO:-0.05}"
 VALID_SPLIT_SEED="${VALID_SPLIT_SEED:-1234}"
 EVAL_ITERS="${EVAL_ITERS:-1}"
@@ -61,9 +69,6 @@ OPTIM_OFFLOAD="${OPTIM_OFFLOAD:-True}"
 OPTIM_OFFLOAD_FRAC="${OPTIM_OFFLOAD_FRAC:-1.0}"
 OPTIM_OFFLOAD_OVERLAP="${OPTIM_OFFLOAD_OVERLAP:-True}"
 USE_PRECISION_AWARE_OPT="${USE_PRECISION_AWARE_OPT:-True}"
-DIST_TIMEOUT_MIN="${DIST_TIMEOUT_MIN:-60}"
-DIST_TIMEOUT_SEC="${DIST_TIMEOUT_SEC:-3600}"
-RDZV_TIMEOUT="${RDZV_TIMEOUT:-1800}"
 
 [[ -d "$REPO_ROOT" ]] || { echo "[ERROR] missing REPO_ROOT: $REPO_ROOT" >&2; exit 1; }
 [[ -d "$MCORE_PATH/iter_0000000" ]] || { echo "[ERROR] missing mcore ckpt: $MCORE_PATH/iter_0000000" >&2; exit 1; }
@@ -72,7 +77,6 @@ RDZV_TIMEOUT="${RDZV_TIMEOUT:-1800}"
 
 mkdir -p "$LOG_DIR" "$(dirname "$OUTPUT_DIR")"
 cd "$REPO_ROOT"
-exec > >(tee "$LOG_FILE") 2>&1
 
 VENV_PY="${VENV_PY:-/opt/venv-mbridge/bin/python}"
 if [[ ! -x "$VENV_PY" ]]; then
@@ -83,24 +87,21 @@ fi
 echo "[run_sft] node ${NODE_RANK}: running install_runtime_deps.sh..."
 bash "$REPO_ROOT/scripts/install_runtime_deps.sh"
 
-# Memory and stability settings.
+# Env (NGC container — patches off)
+export MBRIDGE_PATCH_NVIDIA_FILE="${MBRIDGE_PATCH_NVIDIA_FILE:-0}"
+export MBRIDGE_DISABLE_CUDNN="${MBRIDGE_DISABLE_CUDNN:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export FLA_AUTOTUNE="${FLA_AUTOTUNE:-0}"
-export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
-export RAYON_RS_NUM_CPUS="${RAYON_RS_NUM_CPUS:-1}"
-export HF_HOME="${HF_HOME:-${MEG_RUN_DIR}/hf_cache}"
-mkdir -p "$HF_HOME"
-
-# NCCL/debug settings retained because this 192-GPU shape has slow first-iter init.
+export MBRIDGE_PATCH_GRAD_FUSION="${MBRIDGE_PATCH_GRAD_FUSION:-0}"
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT}"
 export PYTHONUNBUFFERED=1
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}"
-export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-1048576}"
-export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
-export TORCH_NCCL_DESYNC_DEBUG="${TORCH_NCCL_DESYNC_DEBUG:-1}"
-export TORCH_NCCL_ENABLE_TIMING="${TORCH_NCCL_ENABLE_TIMING:-1}"
-export TORCH_NCCL_TRACE_CPP_STACK="${TORCH_NCCL_TRACE_CPP_STACK:-1}"
+export TORCH_NCCL_AVOID_RECORD_STREAMS="${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export FLA_AUTOTUNE="${FLA_AUTOTUNE:-0}"
+export HF_HOME="${HF_HOME:-${MEG_RUN_DIR}/hf_cache}"
+mkdir -p "$HF_HOME"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export RAYON_RS_NUM_CPUS="${RAYON_RS_NUM_CPUS:-1}"
 
 OVERRIDES=(
     --recipe "$RECIPE"
@@ -113,27 +114,27 @@ OVERRIDES=(
     model.context_parallel_size="$CP"
     model.expert_model_parallel_size="$EP"
     model.seq_length="$SEQ"
-
-    dist.distributed_timeout_minutes="$DIST_TIMEOUT_MIN"
-    dist.distributed_timeout_seconds_after_init="$DIST_TIMEOUT_SEC"
+    dist.distributed_timeout_minutes="${DIST_TIMEOUT_MINUTES:-30}"
 
     # Activation memory.
     model.recompute_granularity=full
-    model.recompute_method=uniform
-    model.recompute_num_layers=1
+    model.recompute_method=block
+    model.recompute_num_layers=4
     model.mtp_num_layers=0
 
-    # Vision memory: keep frozen for 96K SFT.
+    # Vision memory: keep frozen for 64K SFT.
     model.freeze_vision_model=True
     model.freeze_vision_projection=True
 
-    # Last-stage memory: TE chunked CE avoids materializing full 96K logits.
-    model.cross_entropy_fusion_impl=te
+    # CP > 1 required flags.
+    model.calculate_per_token_loss=True
+    ddp.average_in_collective=False
+
+    # Disable fused CE under CP; qwen3_vl_step slices labels per CP rank.
+    model.cross_entropy_loss_fusion=False
 
     # GDN/linear-attention does not support packed THD layout.
     dataset.pack_sequences_in_batch=False
-
-    model.moe_z_loss_coeff="$MOE_Z_LOSS_COEFF"
 
     # Optimizer memory.
     optimizer.optimizer_cpu_offload="$OPTIM_OFFLOAD"
@@ -155,42 +156,33 @@ OVERRIDES=(
     dataset.train_data_path="$TRAIN_DATA"
     dataset.hf_processor_path="$HF_MODEL"
     dataset.seq_length="$SEQ"
-    dataset.drop_overlength_samples="$DROP_OVERLENGTH"
-    dataset.validation_split_ratio="$VALID_SPLIT_RATIO"
-    dataset.validation_split_seed="$VALID_SPLIT_SEED"
 
     logger.log_interval="$LOG_INTERVAL"
     logger.tensorboard_dir=null
     logger.wandb_project=null
 )
 
-if [[ -n "$LR" ]]; then
-    OVERRIDES+=(optimizer.lr="$LR")
-fi
-if [[ -n "$LR_WARMUP_ITERS" ]]; then
-    OVERRIDES+=(scheduler.lr_warmup_iters="$LR_WARMUP_ITERS")
-fi
-if [[ -n "$MOE_AUX_LOSS_COEFF" ]]; then
-    OVERRIDES+=(model.moe_aux_loss_coeff="$MOE_AUX_LOSS_COEFF")
-fi
-
 cat <<EOF
 ============================================================
-Qwen3.5-122B-A10B FULL SFT (24-node, 96K)
+Qwen3.5-122B-A10B FULL SFT (24-node, 64K)
   Recipe       : $RECIPE
   HF model dir : $HF_MODEL
   Mcore base   : $MCORE_PATH
   Train data   : $TRAIN_DATA
   Output       : $OUTPUT_DIR
-  Nodes/GPUs   : ${NNODES} × ${NPROC}   (node rank ${NODE_RANK})
+  Nodes/GPUs   : ${NNODES} × ${NPROC}   (this is rank ${NODE_RANK})
   Master       : ${MASTER_ADDR}:${MASTER_PORT}
-  Parallelism  : TP=${TP} PP=${PP} CP=${CP} EP=${EP} DP=$(( NNODES * NPROC / TP / PP / CP ))
-  Batch/Seq    : GBS=${GBS} MBS=${MBS} SEQ=${SEQ}
-  Memory       : vision frozen, TE CE, recompute full/uniform/1, MTP off, optim offload=${OPTIM_OFFLOAD}
-  Timeout      : init=${DIST_TIMEOUT_MIN}min steady=${DIST_TIMEOUT_SEC}s rdzv=${RDZV_TIMEOUT}s
+  Parallelism  : TP=${TP}  PP=${PP}  CP=${CP}  EP=${EP}  DP=$(( NNODES * NPROC / TP / PP / CP ))
+  Iters/GBS    : ${ITERS} / ${GBS}    MBS=${MBS}
+  Seq length   : ${SEQ}
+  Valid split  : ${VALID_SPLIT_RATIO}
+  Eval         : every ${EVAL_INTERVAL}, iters=${EVAL_ITERS}
   Log file     : $LOG_FILE
+  Venv python  : $VENV_PY
 ============================================================
 EOF
+
+RDZV_TIMEOUT="${RDZV_TIMEOUT:-1800}"
 
 "$VENV_PY" -u -m torch.distributed.run \
     --nproc_per_node="$NPROC" \
@@ -200,4 +192,5 @@ EOF
     --master_port="$MASTER_PORT" \
     --rdzv_conf "timeout=${RDZV_TIMEOUT}" \
     scripts/training/run_recipe.py \
-    "${OVERRIDES[@]}"
+    "${OVERRIDES[@]}" \
+    2>&1 | tee "$LOG_FILE"
