@@ -30,23 +30,16 @@ else
 fi
 
 # 96 节点 demo
-cd /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg
-bash run/start_ray.sh
-
-NODE_RANK_VALUE="${NODE_RANK:-${RANK:-0}}"
-if [[ "$NODE_RANK_VALUE" -eq 0 ]]; then
-    python run/run_on_all_nodes.py scripts/run_sft_qwen35_122b_12node_hade.sh --env-file run/env20-10.log
-else
-    sleep infinity
-fi
+python run/run_on_all_nodes.py scripts/run_sft_qwen35_122b_12node_hade.sh --env-file run/env20-10.txt
 
 # 192 节点 demo
-cd /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg
-bash run/start_ray.sh
+/opt/venv-mbridge/bin/python /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/run_on_all_nodes.py /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/scripts/run_sft_qwen35_122b_24node_hade.sh --env-file /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/env20-10.txt --master-port 23456 --master-addr $(hostname -i)
 
-NODE_RANK_VALUE="${NODE_RANK:-${RANK:-0}}"
-if [[ "$NODE_RANK_VALUE" -eq 0 ]]; then
-    /opt/venv-mbridge/bin/python /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/run_on_all_nodes.py /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/scripts/run_sft_qwen35_122b_24node_hade.sh --env-file /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/env20-10.log --master-port 23456 --master-addr $(hostname -i)
-else
-    sleep infinity
-fi
+# 256 节点 demo
+/opt/venv-mbridge/bin/python /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/run_on_all_nodes.py /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/scripts/run_sft_qwen35_122b_32node_hade.sh --env-file /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/env5k-30-20.txt --master-port 23456 --master-addr $(hostname -i)
+
+# rushb
+/opt/venv-mbridge/bin/python /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/run_on_all_nodes.py /mnt/tidal-alsh01/dataset/pai/zhaoxiang02/run_rushb.sh
+
+# clean all
+/opt/venv-mbridge/bin/python /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/run_on_all_nodes.py --cleanup

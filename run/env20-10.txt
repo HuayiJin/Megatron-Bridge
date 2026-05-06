@@ -1,0 +1,5 @@
+TRAIN_DATA=/mnt/tidal-alsh01/dataset/pai/hade/dd/meg-run/demo_data2/train5000.filtered_lt20k_lt10img.jsonl
+MASTER_PORT=23456
+https_proxy=http://10.7.4.2:3128
+HTTPS_PROXY=http://10.7.4.2:3128
+NCCL_IB_TIMEOUT=30
