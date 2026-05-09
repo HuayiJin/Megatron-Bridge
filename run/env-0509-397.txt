@@ -1,0 +1,8 @@
+HF_MODEL=/mnt/tidal-alsh01/dataset/pai/models/Qwen3.5/Qwen3.5-397B-A17B
+MCORE_PATH=/mnt/tidal-alsh01/dataset/pai/hade/data/Qwen3.5-397B-A17B-mcore
+TRAIN_DATA=/mnt/tidal-alsh01/dataset/pai/hade/dd/meg-run/demo_data2/sft_1k_tool_call_0509.jsonl
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/pai/hade/dd/meg-run/qwen35_397b_sft
+MASTER_PORT=23456
+https_proxy=http://10.7.4.2:3128
+HTTPS_PROXY=http://10.7.4.2:3128
+NCCL_IB_TIMEOUT=30

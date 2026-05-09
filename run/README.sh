@@ -17,9 +17,29 @@ export WHEEL_DIR="${MEG_RUN_DIR}/wheels"
 export https_proxy=http://10.7.4.2:3128
 export HTTPS_PROXY=http://10.7.4.2:3128
 
-# 3. 安装运行时依赖
+# 3. 每个 node/container 上启动或加入 Ray 集群。
+#    rank 0 会继续下发训练任务；其他 rank 必须 hold 住容器，否则 Ray worker 会随容器退出而掉线。
 cd /mnt/tidal-alsh01/dataset/redone/hade/dd/Megatron-Bridge
-bash scripts/install_runtime_deps.sh
+bash run/start_ray.sh
 
-# 4. 执行
-bash run/start_4node.sh
+NODE_RANK_VALUE="${NODE_RANK:-${RANK:-0}}"
+if [[ "$NODE_RANK_VALUE" -eq 0 ]]; then
+    /opt/venv-mbridge/bin/python run/run_on_all_nodes.py scripts/run_sft_qwen35_122b_24node_hade.sh
+else
+    sleep infinity
+fi
+
+# 96 节点 demo
+python run/run_on_all_nodes.py scripts/run_sft_qwen35_122b_12node_hade.sh --env-file run/env20-10.txt
+
+# 192 节点 demo
+/opt/venv-mbridge/bin/python /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/run_on_all_nodes.py /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/scripts/run_sft_qwen35_122b_24node_hade.sh --env-file /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/env20-10.txt --master-port 23456 --master-addr $(hostname -i)
+
+# 256 节点 demo
+/opt/venv-mbridge/bin/python /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/run_on_all_nodes.py /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/scripts/run_sft_qwen35_122b_32node_hade.sh --env-file /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/env5k-30-20.txt --master-port 23456 --master-addr $(hostname -i)
+
+# rushb
+/opt/venv-mbridge/bin/python /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/run_on_all_nodes.py /mnt/tidal-alsh01/dataset/pai/zhaoxiang02/run_rushb.sh
+
+# clean all
+/opt/venv-mbridge/bin/python /mnt/tidal-alsh01/dataset/pai/hade/dd/Megatron-Bridge-dbg/run/run_on_all_nodes.py --cleanup
