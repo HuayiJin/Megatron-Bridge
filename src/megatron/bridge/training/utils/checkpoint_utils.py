@@ -185,12 +185,58 @@ def is_checkpoint_iteration_directory(path: Optional[str]) -> bool:
     return any(file_exists(join_paths(path, m)) for m in _ITERATION_DIR_MARKERS)
 
 
+def is_hf_checkpoint(checkpoints_path: Optional[str]) -> bool:
+    """Check if a directory contains a HuggingFace model checkpoint.
+
+    A HuggingFace checkpoint is identified by the presence of ``config.json``
+    alongside weight files (``*.safetensors`` or ``*.bin``), without any
+    Megatron Bridge checkpoint markers.
+
+    Args:
+        checkpoints_path: Path to the potential HuggingFace checkpoint directory.
+
+    Returns:
+        True if the directory looks like a HuggingFace checkpoint, False otherwise.
+    """
+    if checkpoints_path is None:
+        return False
+
+    if not file_exists(checkpoints_path):
+        return False
+
+    config_json = join_paths(checkpoints_path, "config.json")
+    if not file_exists(config_json):
+        return False
+
+    if is_checkpoint_iteration_directory(checkpoints_path):
+        return False
+
+    has_safetensors_index = file_exists(join_paths(checkpoints_path, "model.safetensors.index.json"))
+    has_bin_index = file_exists(join_paths(checkpoints_path, "pytorch_model.bin.index.json"))
+
+    if has_safetensors_index or has_bin_index:
+        return True
+
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        entries = msc.os.listdir(checkpoints_path)
+    else:
+        entries = os.listdir(checkpoints_path)
+
+    has_safetensors = any(e.endswith(".safetensors") for e in entries)
+    has_bin = any(e.endswith(".bin") for e in entries)
+
+    return has_safetensors or has_bin
+
+
 def checkpoint_exists(checkpoints_path: Optional[str]) -> bool:
     """Check if a checkpoint directory exists.
 
     Supports both parent checkpoint directories (containing tracker files) and
     specific iteration directories (containing checkpoint markers such as
     ``run_config.yaml``, ``metadata.json``, or ``.metadata``).
+    Also supports HuggingFace checkpoint directories (containing ``config.json``
+    and weight files).
 
     Args:
         checkpoints_path: Path to the potential checkpoint directory.
@@ -214,9 +260,14 @@ def checkpoint_exists(checkpoints_path: Optional[str]) -> bool:
     path = get_checkpoint_tracker_filename(checkpoints_path)
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
-        return msc.os.path.isfile(path)
+        if msc.os.path.isfile(path):
+            return True
     else:
-        return os.path.isfile(path)
+        if os.path.isfile(path):
+            return True
+
+    # HuggingFace checkpoint directory
+    return is_hf_checkpoint(checkpoints_path)
 
 
 def get_hf_model_id_from_checkpoint(path: str | os.PathLike[str]) -> str | None:

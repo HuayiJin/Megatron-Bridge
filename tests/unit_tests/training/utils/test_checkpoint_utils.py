@@ -31,6 +31,7 @@ from megatron.bridge.training.utils.checkpoint_utils import (
     get_checkpoint_train_state_filename,
     get_hf_model_id_from_checkpoint,
     is_checkpoint_iteration_directory,
+    is_hf_checkpoint,
     read_run_config,
     read_train_state,
 )
@@ -831,3 +832,91 @@ class TestCheckpointUtils:
         (ckpt_dir / f"{TRACKER_PREFIX}_{TRAIN_STATE_FILE}").touch()
 
         assert checkpoint_exists(str(ckpt_dir)) is True
+
+    # ===== is_hf_checkpoint tests =====
+
+    def test_is_hf_checkpoint_with_safetensors(self, tmp_path):
+        """Test is_hf_checkpoint detects a directory with config.json and .safetensors."""
+        hf_dir = tmp_path / "hf_model"
+        hf_dir.mkdir()
+        (hf_dir / "config.json").touch()
+        (hf_dir / "model.safetensors").touch()
+
+        assert is_hf_checkpoint(str(hf_dir)) is True
+
+    def test_is_hf_checkpoint_with_safetensors_index(self, tmp_path):
+        """Test is_hf_checkpoint detects a sharded safetensors model."""
+        hf_dir = tmp_path / "hf_model"
+        hf_dir.mkdir()
+        (hf_dir / "config.json").touch()
+        (hf_dir / "model.safetensors.index.json").touch()
+
+        assert is_hf_checkpoint(str(hf_dir)) is True
+
+    def test_is_hf_checkpoint_with_bin_index(self, tmp_path):
+        """Test is_hf_checkpoint detects a sharded pytorch_model.bin model."""
+        hf_dir = tmp_path / "hf_model"
+        hf_dir.mkdir()
+        (hf_dir / "config.json").touch()
+        (hf_dir / "pytorch_model.bin.index.json").touch()
+
+        assert is_hf_checkpoint(str(hf_dir)) is True
+
+    def test_is_hf_checkpoint_with_bin_files(self, tmp_path):
+        """Test is_hf_checkpoint detects a directory with .bin weight files."""
+        hf_dir = tmp_path / "hf_model"
+        hf_dir.mkdir()
+        (hf_dir / "config.json").touch()
+        (hf_dir / "pytorch_model-00001-of-00002.bin").touch()
+
+        assert is_hf_checkpoint(str(hf_dir)) is True
+
+    def test_is_hf_checkpoint_without_config_json(self, tmp_path):
+        """Test is_hf_checkpoint returns False when config.json is missing."""
+        hf_dir = tmp_path / "hf_model"
+        hf_dir.mkdir()
+        (hf_dir / "model.safetensors").touch()
+
+        assert is_hf_checkpoint(str(hf_dir)) is False
+
+    def test_is_hf_checkpoint_without_weight_files(self, tmp_path):
+        """Test is_hf_checkpoint returns False when no weight files are present."""
+        hf_dir = tmp_path / "hf_model"
+        hf_dir.mkdir()
+        (hf_dir / "config.json").touch()
+
+        assert is_hf_checkpoint(str(hf_dir)) is False
+
+    def test_is_hf_checkpoint_with_megatron_markers(self, tmp_path):
+        """Test is_hf_checkpoint returns False when Megatron checkpoint markers are present."""
+        ckpt_dir = tmp_path / "checkpoints"
+        ckpt_dir.mkdir()
+        (ckpt_dir / "config.json").touch()
+        (ckpt_dir / "model.safetensors").touch()
+        (ckpt_dir / CONFIG_FILE).touch()
+
+        assert is_hf_checkpoint(str(ckpt_dir)) is False
+
+    def test_is_hf_checkpoint_none_path(self):
+        """Test is_hf_checkpoint returns False for None."""
+        assert is_hf_checkpoint(None) is False
+
+    def test_is_hf_checkpoint_nonexistent(self):
+        """Test is_hf_checkpoint returns False for a nonexistent path."""
+        assert is_hf_checkpoint("/nonexistent/hf_model") is False
+
+    def test_checkpoint_exists_with_hf_directory(self, tmp_path):
+        """Test checkpoint_exists detects a HuggingFace checkpoint directory."""
+        hf_dir = tmp_path / "hf_model"
+        hf_dir.mkdir()
+        (hf_dir / "config.json").touch()
+        (hf_dir / "model.safetensors").touch()
+
+        assert checkpoint_exists(str(hf_dir)) is True
+
+    def test_checkpoint_exists_empty_dir_returns_false(self, tmp_path):
+        """Test checkpoint_exists returns False for an empty directory (no HF, no Megatron)."""
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+
+        assert checkpoint_exists(str(empty_dir)) is False

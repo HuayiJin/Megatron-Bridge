@@ -78,6 +78,7 @@ from megatron.bridge.training.utils.checkpoint_utils import (
     get_checkpoint_tracker_filename,
     get_checkpoint_train_state_filename,
     is_checkpoint_iteration_directory,
+    is_hf_checkpoint,
     read_run_config,
     read_train_state,
 )
@@ -1798,6 +1799,64 @@ def _load_model_weights_from_checkpoint(
         torch.distributed.barrier()
 
 
+def _load_hf_checkpoint(
+    hf_path: str,
+    state: GlobalState,
+    model: list[MegatronModule],
+    optimizer: Optional[MegatronOptimizer],
+    skip_load_to_model_and_opt: bool = False,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> tuple[int, int]:
+    """Load a HuggingFace checkpoint into a Megatron model via AutoBridge.
+
+    This function detects a HuggingFace model directory and performs runtime
+    weight conversion from HF format (safetensors/bin) to Megatron-Core
+    distributed format, without requiring a pre-converted DCP checkpoint.
+
+    Args:
+        hf_path: Path to the HuggingFace model directory.
+        state: The GlobalState object.
+        model: The model module(s) to load state into.
+        optimizer: The optimizer instance (will be reloaded after model load).
+        skip_load_to_model_and_opt: If True, skips loading weights into model.
+        pg_collection: Optional process group collection.
+
+    Returns:
+        A tuple of (iteration=0, num_floating_point_operations_so_far=0).
+    """
+    from megatron.bridge import AutoBridge
+
+    cfg = state.cfg
+    trust_remote_code = getattr(cfg.model, "trust_remote_code", False)
+    pg_collection = pg_collection or get_pg_collection(model)
+    print_rank_0(f"Loading HuggingFace checkpoint into Megatron model (path={hf_path})")
+
+    if not skip_load_to_model_and_opt:
+        unwrapped_model_list = unwrap_model(model)
+
+        bridge = AutoBridge.from_hf_pretrained(hf_path, trust_remote_code=trust_remote_code)
+        bridge.load_hf_weights(unwrapped_model_list)
+
+        if (cfg.model.fp16 or cfg.model.bf16) and optimizer is not None and not cfg.ddp.use_megatron_fsdp:
+            optimizer.reload_model_params()
+
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    iteration = 0
+    num_floating_point_operations_so_far = 0
+    state.train_state.step = 0
+
+    print_rank_0(
+        f"  successfully loaded HuggingFace checkpoint from {hf_path} "
+        f"[ t {pg_collection.tp.rank()}/{pg_collection.tp.size()}, "
+        f"p {pg_collection.pp.rank()}/{pg_collection.pp.size()} ] "
+        f"at iteration {state.train_state.step}"
+    )
+
+    return iteration, num_floating_point_operations_so_far
+
+
 def load_checkpoint(
     state: GlobalState,
     model: list[MegatronModule],
@@ -1814,6 +1873,7 @@ def load_checkpoint(
     Handles loading model state, optimizer state, scheduler state, RNG state,
     and other metadata based on the configuration and checkpoint type.
     Supports loading global distributed and local non-persistent checkpoints.
+    Also supports loading directly from HuggingFace checkpoint directories.
 
     Args:
         state: The GlobalState object.
@@ -1848,6 +1908,19 @@ def load_checkpoint(
         if not checkpoint_exists(load_dir):
             raise FileNotFoundError("No checkpoint found in load directory or pretrained directory")
         cfg.checkpoint.finetune = True
+
+    # Detect HuggingFace checkpoint and load via AutoBridge
+    if is_hf_checkpoint(load_dir):
+        if not cfg.checkpoint.finetune:
+            cfg.checkpoint.finetune = True
+        return _load_hf_checkpoint(
+            hf_path=load_dir,
+            state=state,
+            model=model,
+            optimizer=optimizer,
+            skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+            pg_collection=pg_collection,
+        )
 
     return _load_checkpoint_from_path(
         load_dir,
@@ -2162,6 +2235,20 @@ def _load_checkpoint_from_path(
         - num_floating_point_operations_so_far: The total FLOPs computed so far.
     """
     cfg = state.cfg
+
+    # Detect HuggingFace checkpoint and load via AutoBridge
+    if is_hf_checkpoint(load_dir):
+        if not cfg.checkpoint.finetune:
+            cfg.checkpoint.finetune = True
+        return _load_hf_checkpoint(
+            hf_path=load_dir,
+            state=state,
+            model=model,
+            optimizer=optimizer,
+            skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+            pg_collection=pg_collection,
+        )
+
     model = unwrap_model(model)
     pg_collection = pg_collection or get_pg_collection(model)
     ckpt_format = cfg.checkpoint.ckpt_format
