@@ -193,6 +193,41 @@ def _qwen35_vl_apply_peft_scheme(cfg: ConfigContainer, peft_scheme: str | PEFT) 
 # since both families share the same VLM architecture and mock-dataset pipeline.
 
 
+def qwen35_vl_4b_pretrain_config(**user_kwargs: Unpack[Qwen3VLCommonKwargs]) -> ConfigContainer:
+    """Return a pre-training config for Qwen3.5-VL 4B (dense).
+
+    See `_qwen3_vl_common` for the full list of parameters.
+    """
+    recommended_kwargs: Qwen3VLCommonKwargs = {
+        "hf_path": "Qwen/Qwen3.5-4B",
+        "tensor_model_parallel_size": 4,
+        "pipeline_model_parallel_size": 1,
+        "expert_model_parallel_size": 1,
+        "freeze_language_model": False,
+        "freeze_vision_model": True,
+        "freeze_vision_projection": True,
+    }
+    combined_kwargs: Qwen3VLCommonKwargs = {**recommended_kwargs, **user_kwargs}
+    return _qwen3_vl_common(**combined_kwargs)
+
+def qwen35_vl_35b_a3b_pretrain_config(**user_kwargs: Unpack[Qwen3VLCommonKwargs]) -> ConfigContainer:
+    """Return a pre-training config for Qwen3.5-VL 4B (dense).
+
+    See `_qwen3_vl_common` for the full list of parameters.
+    """
+    recommended_kwargs: Qwen3VLCommonKwargs = {
+        "hf_path": "Qwen/Qwen3.5-35B-A3B",
+        "tensor_model_parallel_size": 8,
+        "pipeline_model_parallel_size": 1,
+        "expert_model_parallel_size": 8,
+        "freeze_language_model": False,
+        "freeze_vision_model": True,
+        "freeze_vision_projection": True,
+    }
+    combined_kwargs: Qwen3VLCommonKwargs = {**recommended_kwargs, **user_kwargs}
+    return _qwen3_vl_common(**combined_kwargs)
+
+
 def qwen35_vl_9b_pretrain_mock_config(**user_kwargs: Unpack[Qwen3VLCommonKwargs]) -> ConfigContainer:
     """Return a pre-training config for Qwen3.5-VL 9B (dense).
 

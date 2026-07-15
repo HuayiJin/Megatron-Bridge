@@ -43,6 +43,8 @@ from .qwen35_vl import (
     qwen35_vl_2b_sft_config,
     qwen35_vl_4b_peft_config,
     qwen35_vl_4b_sft_config,
+    qwen35_vl_4b_pretrain_config,
+    qwen35_vl_35b_a3b_pretrain_config,
     qwen35_vl_9b_peft_config,
     qwen35_vl_9b_pretrain_mock_config,
     qwen35_vl_9b_sft_config,
@@ -65,6 +67,8 @@ from .qwen35_vl import (
 
 __all__ = [
     # Qwen3.5-VL pretrain configs
+    "qwen35_vl_4b_pretrain_config",
+    "qwen35_vl_35b_a3b_pretrain_config",
     "qwen35_vl_9b_pretrain_mock_config",
     "qwen35_vl_35b_a3b_pretrain_mock_config",
     "qwen35_vl_122b_a10b_pretrain_mock_config",
