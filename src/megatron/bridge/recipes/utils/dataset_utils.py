@@ -31,6 +31,7 @@ from megatron.bridge.training.config import (
     FinetuningDatasetConfig,
     GPTDatasetConfig,
     MockGPTDatasetConfig,
+    OnlinePretrainDatasetConfig,
 )
 
 
@@ -112,6 +113,7 @@ def get_blend_fields_from_data_paths(
 DATASET_TYPES = [
     "llm-pretrain",
     "llm-pretrain-mock",
+    "llm-pretrain-online",
     "llm-finetune",
     "llm-finetune-preloaded",
     "vlm-energon",
@@ -200,6 +202,20 @@ def apply_dataset_override(
             split="9999,8,2",
             data_sharding=True,
             dataloader_type="single",
+            skip_getting_attention_mask_from_dataset=True,
+        )
+
+    elif dataset_type == "llm-pretrain-online":
+        config.dataset = OnlinePretrainDatasetConfig(
+            seq_length=resolved_seq_length,
+            data_path="",
+            dataloader_type="single",
+            data_sharding=True,
+            num_workers=4,
+            num_dataset_builder_threads=1,
+            reset_attention_mask=False,
+            reset_position_ids=False,
+            eod_mask_loss=False,
             skip_getting_attention_mask_from_dataset=True,
         )
 

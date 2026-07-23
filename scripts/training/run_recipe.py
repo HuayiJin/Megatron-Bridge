@@ -33,6 +33,12 @@ Usage:
             --dataset llm-pretrain \\
             'dataset.blend=[[/data/my_dataset_text_document],null]'
 
+    Pretrain (on-the-fly from parquet/jsonl):
+        uv run torchrun --nproc_per_node=8 run_recipe.py \\
+            --recipe llama32_1b_pretrain_config \\
+            --dataset llm-pretrain-online \\
+            dataset.data_path=/data/my_parquet_dir
+
     Finetune (SQuAD, default):
         uv run torchrun --nproc_per_node=8 run_recipe.py \\
             --recipe llama32_1b_sft_config \\
@@ -179,6 +185,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
             "LLM datasets:\n"
             "  llm-pretrain           GPT pretrain data (set dataset.blend=<path>)\n"
             "  llm-pretrain-mock      Mock pretrain data for testing\n"
+            "  llm-pretrain-online    On-the-fly pretrain from parquet/jsonl (set dataset.data_path=<dir>)\n"
             "  llm-finetune           HF finetune dataset (set dataset.dataset_name=squad|gsm8k|openmathinstruct2)\n"
             "  llm-finetune-preloaded User-supplied JSONL (set dataset.dataset_root=<path>)\n"
             "VLM datasets:\n"

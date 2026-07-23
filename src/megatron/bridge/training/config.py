@@ -345,6 +345,117 @@ class DatasetProvider(DataloaderConfig, ABC):
         pass
 
 
+@dataclass(kw_only=True)
+class OnlinePretrainDatasetConfig(DatasetProvider):
+    """Pretrain dataset config with on-the-fly tokenization from parquet/jsonl.
+
+    Mirrors Megatron-Core's *offline* GPT MMap dataset
+    (``megatron.core.datasets.gpt_dataset.GPTDataset``) as closely as
+    possible, except documents are tokenized at access time instead of being
+    read from a pre-built binary: per split, documents are conceptually
+    concatenated into one token stream (EOD-terminated, reshuffled every
+    epoch) and fixed ``seq_length`` windows are sliced out as samples.
+    ``reset_position_ids`` / ``reset_attention_mask`` / ``eod_mask_loss``
+    have exactly the same semantics as ``GPTDatasetConfig`` (document
+    boundaries are found by scanning for the EOD token value within the
+    window; no cu_seqlens/THD packing is involved). See
+    ``megatron.bridge.data.datasets.online_pretrain`` for details.
+
+    Required CLI overrides:
+        dataset.data_path=<path>   Path to input data (directory, glob, or file)
+
+    Optional CLI overrides:
+        dataset.text_key=text      Column/key name for text content
+        dataset.append_eod=True    Append EOD token after each document
+    """
+
+    data_path: str = ""
+    """Path to input data: directory, glob pattern, or single file (.parquet/.jsonl/.jsonl.gz)"""
+
+    text_key: str = "text"
+    """Column name (parquet) or JSON key (jsonl) for text content"""
+
+    seq_length: int = 4096
+    """Number of tokens per sample window (documents are concatenated across
+    windows, never truncated, exactly like the offline GPT MMap dataset)."""
+
+    append_eod: bool = True
+    """Append EOD token after each non-empty document (mirrors
+    ``tools/preprocess_data.py --append-eod``). Required for
+    ``reset_position_ids`` / ``reset_attention_mask`` / ``eod_mask_loss`` to
+    have any effect, since document boundaries are located by scanning for
+    this token."""
+
+    split: str = "9999,8,2"
+    """Train/valid/test split ratio (comma-separated)"""
+
+    random_seed: int = 1234
+    """Random seed for document/sample shuffling (must be same on all ranks)"""
+
+    lengths_cache_path: str | None = None
+    """Optional path to cache token lengths (avoids re-tokenizing at init on subsequent runs)"""
+
+    num_dataset_builder_threads: int = 1
+    """Number of threads for dataset building (record counting + tokenization).
+    Mirrors ``BlendedMegatronDatasetConfig.num_dataset_builder_threads`` used by the
+    offline GPT MMap dataset builder. Rank 0 may use additional threads scaled by GPU
+    count when building alone before the barrier. Set > 1 to parallelize metadata reads
+    and tokenization across many files (recommended for NFS / Lustre with large datasets)."""
+
+    skip_getting_attention_mask_from_dataset: bool = True
+    """If True (default), the dataset never builds a dense attention mask and the
+    attention backend auto-generates a plain causal mask instead (matches offline's
+    ``GPTDatasetConfig`` default recipe). Set False together with
+    ``reset_attention_mask=True`` to actually receive a document-boundary-aware mask."""
+
+    reset_attention_mask: bool = False
+    """Block cross-document attention within a sample window (offline-style EOD
+    scanning). Only takes effect when ``skip_getting_attention_mask_from_dataset=False``."""
+
+    reset_position_ids: bool = False
+    """Reset position ids to 0 at each document boundary within a sample window."""
+
+    eod_mask_loss: bool = False
+    """Zero out the loss at EOD token positions."""
+
+    def build_datasets(self, context: DatasetBuildContext) -> tuple:
+        """Build train, valid, and test datasets.
+
+        Args:
+            context: Build context with sample counts and tokenizer.
+
+        Returns:
+            Tuple of (train_dataset, valid_dataset, test_dataset).
+        """
+        from megatron.bridge.data.datasets.online_pretrain import (
+            build_train_valid_test_datasets as _build,
+            resolve_input_files,
+        )
+
+        file_paths = resolve_input_files(self.data_path)
+        if context.tokenizer is None:
+            raise ValueError("Tokenizer is required for OnlinePretrainDatasetConfig")
+
+        return _build(
+            file_paths=file_paths,
+            tokenizer=context.tokenizer,
+            seq_length=self.seq_length,
+            split=self.split,
+            text_key=self.text_key,
+            append_eod=self.append_eod,
+            reset_position_ids=self.reset_position_ids,
+            reset_attention_mask=self.reset_attention_mask,
+            eod_mask_loss=self.eod_mask_loss,
+            create_attention_mask=not self.skip_getting_attention_mask_from_dataset,
+            seed=self.random_seed,
+            lengths_cache_path=self.lengths_cache_path,
+            num_dataset_builder_threads=self.num_dataset_builder_threads,
+            train_samples=context.train_samples,
+            valid_samples=context.valid_samples,
+            test_samples=context.test_samples,
+        )
+
+
 @dataclass
 class GPTDatasetConfig(MCoreGPTDatasetConfig, DataloaderConfig):
     """Megatron Core GPTDatasetConfig with deferred post-init.
