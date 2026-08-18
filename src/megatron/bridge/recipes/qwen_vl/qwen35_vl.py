@@ -27,7 +27,7 @@ from typing_extensions import Unpack
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.peft.base import PEFT
-from megatron.bridge.recipes.common import _peft_common_vlm, _sft_common_vlm
+from megatron.bridge.recipes.common import _peft_common_vlm, _sft_common_vlm, _sft_common
 from megatron.bridge.recipes.qwen_vl.qwen3_vl import Qwen3VLCommonKwargs, _qwen3_vl_common
 from megatron.bridge.recipes.utils.finetune_utils import default_peft_config
 from megatron.bridge.recipes.utils.optimizer_utils import distributed_fused_adam_with_cosine_annealing
@@ -228,6 +228,23 @@ def qwen35_vl_35b_a3b_pretrain_config(**user_kwargs: Unpack[Qwen3VLCommonKwargs]
     return _qwen3_vl_common(**combined_kwargs)
 
 
+def qwen35_vl_35b_a3b_pruner_pretrain_config(**user_kwargs: Unpack[Qwen3VLCommonKwargs]) -> ConfigContainer:
+    """Return a pre-training config for Qwen3.5-VL 4B (dense).
+
+    See `_qwen3_vl_common` for the full list of parameters.
+    """
+    recommended_kwargs: Qwen3VLCommonKwargs = {
+        "hf_path": "/mnt/ali-sh-1/dataset/redone/zhiting/Qwen_Pruner/output/Qwen3.5-CPT-width1536-expert128",
+        "tensor_model_parallel_size": 8,
+        "pipeline_model_parallel_size": 1,
+        "expert_model_parallel_size": 8,
+        "freeze_language_model": False,
+        "freeze_vision_model": True,
+        "freeze_vision_projection": True,
+    }
+    combined_kwargs: Qwen3VLCommonKwargs = {**recommended_kwargs, **user_kwargs}
+    return _qwen3_vl_common(**combined_kwargs)
+
 def qwen35_vl_9b_pretrain_mock_config(**user_kwargs: Unpack[Qwen3VLCommonKwargs]) -> ConfigContainer:
     """Return a pre-training config for Qwen3.5-VL 9B (dense).
 
@@ -417,6 +434,46 @@ def qwen35_vl_35b_a3b_sft_config(hf_path: str = "Qwen/Qwen3.5-35B-A3B") -> Confi
     cfg = _sft_common_vlm()
     _qwen35_vl_apply_common(cfg, hf_path, tp=2, pp=1, max_lr=2e-5, min_lr=2e-6)
     _qwen35_vl_apply_moe(cfg, ep=16)
+    return cfg
+
+
+def qwen35_vl_35b_a3b_text_sft_config(hf_path: str = "Qwen/Qwen3.5-35B-A3B") -> ConfigContainer:
+    """Return a full SFT config for Qwen3.5-VL 35B-A3B (MoE).
+
+    Default configuration: 2 nodes, 16 GPUs
+    - TP=2, PP=1, EP=16
+    - LR=2e-5 (full SFT)
+    - Sequence length: 4096
+
+    Args:
+        hf_path: HuggingFace model ID or local path to model directory.
+    """
+    cfg = _sft_common()
+    cfg.dataset.packed_sequence_specs.packed_sequence_size = 8192
+    cfg.dataset.dataset_kwargs = {
+        "pad_to_max_length": True,
+        "chat": True,
+        "use_hf_tokenizer_chat_template": True,
+    }
+
+    _qwen35_vl_apply_common(cfg, hf_path, tp=2, pp=1, max_lr=2e-5, min_lr=2e-6)
+    _qwen35_vl_apply_moe(cfg, ep=16)
+    return cfg
+
+
+def qwen35_vl_4b_text_sft_config(hf_path: str = "Qwen/Qwen3.5-4B") -> ConfigContainer:
+    """Return a full SFT config for Qwen3.5-VL 4B.
+
+    Default configuration: 2 nodes, 16 GPUs
+    - TP=2, PP=1
+    - LR=2e-5 (full SFT)
+    - Sequence length: 4096
+
+    Args:
+        hf_path: HuggingFace model ID or local path to model directory.
+    """
+    cfg = _sft_common()
+    _qwen35_vl_apply_common(cfg, hf_path, tp=2, pp=1, max_lr=2e-5, min_lr=2e-6)
     return cfg
 
 

@@ -205,6 +205,7 @@ def get_batch(
 
     cp_size = pg_collection.cp.size()
     has_packed = batch.get("cu_seqlens") is not None
+    # is_hybrid_cp = cfg.model.hierarchical_context_parallel_sizes is not None
     if has_packed and cp_size > 1:
         batch = _partition_packed_batch_for_cp(batch, cp_size)
     else:

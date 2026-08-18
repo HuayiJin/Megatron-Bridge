@@ -377,6 +377,20 @@ class Qwen3VLModel(MegatronModule):
             output (torch.Tensor): Loss of shape [b, s] if labels are provided, otherwise logits of shape
                 [b, s, vocab_size].
         """
+
+        # torch.save(
+        #     {
+        #         "input_ids": input_ids,
+        #         "position_ids": position_ids,
+        #         "attention_mask": attention_mask,
+        #         "packed_seq_params": packed_seq_params,
+        #         "labels": labels,
+        #         "loss_mask": loss_mask,
+        #     },
+        #     f"/mnt/tidal-alsh01/dataset/redone/heruozhou/saving/args_{self.tp_group.rank()}.pt"
+        # )
+        # exit(0)
+
         del inference_context, mm_token_type_ids  # Unused, kept for API compatibility
         assert inference_params is None, "not support inference"
 

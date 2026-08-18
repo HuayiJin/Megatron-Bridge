@@ -242,7 +242,6 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
 
     labels = batch["input_ids"].clone()[:, 1:].contiguous()
     labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
-    labels[torch.isin(labels, skipped_tokens)] = -100
     batch["labels"] = labels
     # Ensure position_ids exist for the model
     if "position_ids" not in batch:
@@ -262,9 +261,22 @@ def qwen2_5_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     loss_mask_t = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
     # Shift loss mask to align with next-token labels timeline
     loss_mask_t = torch.cat([loss_mask_t[:, 1:], torch.zeros_like(loss_mask_t[:, :1])], dim=1)
+    # Include EOS token in loss mask so the model learns to stop generating.
+    # Follows qwen2_audio_collate_fn convention: do not apply skipped_tokens
+    # masking to labels, allowing the model to predict <|im_end|> after
+    # assistant turns.
+    eos_token_id = getattr(processor.tokenizer, "eos_token_id", None)
+    if eos_token_id is not None:
+        is_eos_label = batch["labels"] == eos_token_id
+        prev_loss = torch.cat([torch.zeros_like(loss_mask_t[:, :1]), loss_mask_t[:, :-1]], dim=1)
+        loss_mask_t = torch.where(is_eos_label & (prev_loss == 1), torch.ones_like(loss_mask_t), loss_mask_t)
     # Enforce label masking to match shifted loss_mask
     batch["labels"] = batch["labels"].masked_fill(loss_mask_t == 0, -100)
     batch["loss_mask"] = loss_mask_t
+    # Store pad_token_id for vlm_step sequence packing
+    batch["pad_token_id"] = getattr(processor.tokenizer, "pad_token_id", None) or getattr(
+        processor.tokenizer, "eos_token_id", None
+    ) or 0
     # Build Qwen2VL visual inputs object and attach to batch; remove raw keys
     visual_inputs = Qwen2_5_VLVisualInputs(
         pixel_values=batch.get("pixel_values"),
@@ -965,7 +977,6 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
     labels = batch["input_ids"].clone()[:, 1:]
     labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
-    labels[torch.isin(labels, skipped_tokens)] = -100
     batch["labels"] = labels
     loss_masks = [
         create_multiturn_loss_mask_by_search(example, input_ids, processor, skipped_tokens)
@@ -974,8 +985,18 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
     loss_mask_t = torch.tensor(loss_masks, dtype=torch.float, device=batch["input_ids"].device)
     # Shift loss mask to align with next-token labels timeline
     loss_mask_t = torch.cat([loss_mask_t[:, 1:], torch.zeros_like(loss_mask_t[:, :1])], dim=1)
+    # Include EOS token in loss mask so the model learns to stop generating.
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None:
+        is_eos_label = batch["labels"] == eos_token_id
+        prev_loss = torch.cat([torch.zeros_like(loss_mask_t[:, :1]), loss_mask_t[:, :-1]], dim=1)
+        loss_mask_t = torch.where(is_eos_label & (prev_loss == 1), torch.ones_like(loss_mask_t), loss_mask_t)
     batch["labels"] = batch["labels"].masked_fill(loss_mask_t == 0, -100)
     batch["loss_mask"] = loss_mask_t
+    # Store pad_token_id for vlm_step sequence packing
+    batch["pad_token_id"] = getattr(tokenizer, "pad_token_id", None) or getattr(
+        tokenizer, "eos_token_id", None
+    ) or 0
     # Build Qwen2VL visual inputs object and attach to batch; remove raw keys
     visual_inputs = Qwen2_5_VLVisualInputs(
         pixel_values=batch.get("pixel_values"),

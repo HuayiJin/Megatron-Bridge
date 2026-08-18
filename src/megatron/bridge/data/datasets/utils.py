@@ -19,12 +19,11 @@ import logging
 import multiprocessing as mp
 import os
 import pickle
-import re
 import signal
 import time
 from functools import lru_cache, partial
 from queue import Empty
-from typing import Any, Callable, Optional, Pattern, Type
+from typing import Any, Callable, Optional, Type
 
 import numpy as np
 import torch
@@ -34,6 +33,8 @@ from torch.utils.data import Dataset
 
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.bridge.utils.safe_pickle import safe_pickle_load
+
+from transformers import AutoTokenizer
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -49,8 +50,6 @@ TYPE_INSTRUCTION: dict[str, str] = {
     "TEXT_TO_VALUE": "",
     "VALUE_TO_TEXT": "",
 }
-
-GENERATION_REGEX: Pattern[str] = re.compile(r"\{%-?\s+generation\s+-?%\}")
 
 __idx_version__: str = "0.2"  # index file version
 __idx_suffix__: str = "idx"  # index file suffix
@@ -931,47 +930,38 @@ def _chat_preprocess(source: dict, tokenizer: MegatronTokenizer, tool_schemas: O
     if getattr(tokenizer, "legacy", False):
         tokenizer = tokenizer._tokenizer
 
-    # assistant mask only works if chat template has generation keyword
-    template_has_generation_kwd = GENERATION_REGEX.search(tokenizer.chat_template) is not None
-
-    if not template_has_generation_kwd:
+    if len(chat) == 0 or chat[-1].get("role") != "assistant":
         raise ValueError(
-            "The tokenizer's chat_template does not contain a {% generation %} block, which is required "
-            "for HF's apply_chat_template to produce assistant-only loss masks via "
-            "return_assistant_tokens_mask=True. Without it, the loss mask would silently fall back to "
-            "all-ones (loss computed on the entire conversation including system/user tokens). "
-            "To fix this, either: (1) patch the chat_template to wrap assistant content with "
-            "{% generation %}...{% endgeneration %}, or (2) use the legacy special-tokens preprocessing "
-            "path instead of use_hf_tokenizer_chat_template=True."
+            "_chat_preprocess requires the conversation to end with an 'assistant' message so an "
+            f"assistant completion span can be located for loss computation; got roles="
+            f"{[message.get('role') for message in chat]}."
         )
 
-    tokenized_chat = tokenizer.apply_chat_template(
-        chat,
-        tools=tools,
-        tokenize=True,
-        return_dict=True,
-        return_assistant_tokens_mask=True,
-    )
+    try:
+        from trl.experimental.utils import DataCollatorForChatML
+    except ImportError as exc:
+        raise ImportError(
+            "_chat_preprocess() requires the optional `trl` dependency (`pip install trl`) to build the "
+            "assistant-only loss mask via `trl.experimental.utils.DataCollatorForChatML`. Unlike HF's "
+            "`apply_chat_template(..., return_assistant_tokens_mask=True)`, this does not require the "
+            "tokenizer's chat_template to contain a `{% generation %}` block, which many chat templates "
+            "(e.g. Qwen's) do not have -- with such templates return_assistant_tokens_mask silently falls "
+            "back to an all-ones mask (loss computed over the entire conversation)."
+        ) from exc
+    collator = DataCollatorForChatML(tokenizer=AutoTokenizer.from_pretrained("/mnt/tidal-alsh01/dataset/redone/checkpoints/opensource/Qwen3.6-35B-A3B"), max_length=8192)
+    batch = collator([{"messages": chat,}])
 
-    # Choose the last conversation as answer other history are context by finding the last masked token
-    # which indicates end of context and beginning of answer
-    input_ids = tokenized_chat.get("input_ids")
-    mask = tokenized_chat["assistant_masks"]
-
-    if 0 in mask:
-        # traverse the list backward for first occurrence of masked token
-        context_end_idx = len(mask) - mask[::-1].index(0)
-    else:
-        context_end_idx = len(mask)
-
-    context_ids = input_ids[:context_end_idx]
-    answer_ids = input_ids[context_end_idx:]
+    input_ids = batch["input_ids"][0].long()
+    loss_mask = batch["labels"][0] != collator.ignore_index
+    loss_mask = loss_mask.bool()
+    answer_ids = input_ids[loss_mask]
+    context_ids = input_ids[loss_mask.logical_not()]
 
     return dict(
-        input_ids=torch.LongTensor(input_ids),
-        loss_mask=torch.BoolTensor(mask),
-        context_ids=torch.LongTensor(context_ids),
-        answer_ids=torch.LongTensor(answer_ids),
+        input_ids=input_ids,
+        loss_mask=loss_mask,
+        context_ids=context_ids,
+        answer_ids=answer_ids,
     )
 
 

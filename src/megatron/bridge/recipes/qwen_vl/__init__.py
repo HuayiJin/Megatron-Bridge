@@ -45,6 +45,8 @@ from .qwen35_vl import (
     qwen35_vl_4b_sft_config,
     qwen35_vl_4b_pretrain_config,
     qwen35_vl_35b_a3b_pretrain_config,
+    qwen35_vl_35b_a3b_text_sft_config,
+    qwen35_vl_4b_text_sft_config,
     qwen35_vl_9b_peft_config,
     qwen35_vl_9b_pretrain_mock_config,
     qwen35_vl_9b_sft_config,
@@ -62,6 +64,7 @@ from .qwen35_vl import (
     qwen35_vl_397b_a17b_sft_config,
     qwen35_vl_800m_peft_config,
     qwen35_vl_800m_sft_config,
+    qwen35_vl_35b_a3b_pruner_pretrain_config,
 )
 
 
@@ -73,6 +76,7 @@ __all__ = [
     "qwen35_vl_35b_a3b_pretrain_mock_config",
     "qwen35_vl_122b_a10b_pretrain_mock_config",
     "qwen35_vl_397b_a17b_pretrain_mock_config",
+    "qwen35_vl_35b_a3b_pruner_pretrain_config",
     # Qwen3.5-VL SFT configs — dense
     "qwen35_vl_800m_sft_config",
     "qwen35_vl_2b_sft_config",
@@ -81,6 +85,8 @@ __all__ = [
     "qwen35_vl_27b_sft_config",
     # Qwen3.5-VL SFT configs — MoE
     "qwen35_vl_35b_a3b_sft_config",
+    "qwen35_vl_35b_a3b_text_sft_config",
+    "qwen35_vl_4b_text_sft_config",
     "qwen35_vl_35b_a3b_fsdp_sft_config",
     "qwen35_vl_122b_a10b_sft_config",
     "qwen35_vl_397b_a17b_sft_config",
