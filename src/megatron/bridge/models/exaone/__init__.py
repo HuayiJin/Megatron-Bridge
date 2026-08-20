@@ -13,7 +13,10 @@
 # limitations under the License.
 
 from megatron.bridge.models.exaone.exaone4 import Exaone4Bridge
-from megatron.bridge.models.exaone.exaone45 import Exaone45Bridge, Exaone45Model, Exaone45ModelProvider
+try:
+    from megatron.bridge.models.exaone.exaone45 import Exaone45Bridge, Exaone45Model, Exaone45ModelProvider
+except ImportError:  # transformers>=5.12 required for EXAONE 4.5; skip on older stacks
+    pass
 from megatron.bridge.models.exaone.exaone_moe import ExaoneMoeBridge, ExaoneMoeModelProvider
 
 

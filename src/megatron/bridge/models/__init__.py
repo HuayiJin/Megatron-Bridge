@@ -43,11 +43,14 @@ from megatron.bridge.models.ernie_vl import (
 from megatron.bridge.models.exaone.exaone4 import (
     Exaone4Bridge,
 )
-from megatron.bridge.models.exaone.exaone45 import (
-    Exaone45Bridge,
-    Exaone45Model,
-    Exaone45ModelProvider,
-)
+try:
+    from megatron.bridge.models.exaone.exaone45 import (
+        Exaone45Bridge,
+        Exaone45Model,
+        Exaone45ModelProvider,
+    )
+except ImportError:  # transformers>=5.12 required for EXAONE 4.5; skip on older stacks
+    pass
 from megatron.bridge.models.exaone.exaone_moe import (
     ExaoneMoeBridge,
     ExaoneMoeModelProvider,
@@ -148,11 +151,14 @@ from megatron.bridge.models.olmoe import (
     OlMoEBridge,
     OlMoEModelProvider,
 )
-from megatron.bridge.models.qwen3_asr import (
-    Qwen3ASRBridge,
-    Qwen3ASRModel,
-    Qwen3ASRModelProvider,
-)
+try:
+    from megatron.bridge.models.qwen3_asr import (
+        Qwen3ASRBridge,
+        Qwen3ASRModel,
+        Qwen3ASRModelProvider,
+    )
+except ImportError:  # transformers>=5.12 required for Qwen3-ASR; skip on older stacks
+    pass
 from megatron.bridge.models.qwen_audio import (
     Qwen2AudioBridge,
     Qwen2AudioModel,
