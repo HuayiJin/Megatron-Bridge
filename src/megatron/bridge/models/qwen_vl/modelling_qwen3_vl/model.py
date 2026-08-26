@@ -441,6 +441,15 @@ class Qwen3VLModel(MegatronModule):
         if "language_module" in input_dict:
             self.language_model.set_input_tensor(input_dict["language_module"])
 
+    def build_schedule_plan(self, *args, **kwargs):
+        """Forward schedule-plan construction to the language model.
+
+        Required by EP A2A overlap (overlap_moe_expert_parallel_comm=True):
+        the pipeline scheduler asks the (wrapped) model for a schedule plan,
+        but only the inner GPTModel implements it.
+        """
+        return self.language_model.build_schedule_plan(*args, **kwargs)
+
     def set_input_tensor(self, input_tensor) -> None:
         """Set input tensor for the model.
 
