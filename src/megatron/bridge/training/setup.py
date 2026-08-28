@@ -547,6 +547,28 @@ def _kd_dataset_hash(cfg: ConfigContainer) -> tuple[str, dict]:
     return md5_hex, dict(identifiers)
 
 
+def _kd_find_lm_host(model: list[MegatronModule]) -> Optional[MegatronModule]:
+    """Find the GPTModel chunk owning ``output_layer`` across wrapper layers.
+
+    Wrappers encountered in practice: MCore DDP / Float16Module / Qwen3VLModel.
+    The VL wrapper exposes neither ``output_layer`` nor attribute forwarding, so
+    we explicitly descend ``module`` then ``language_model``. The returned host
+    must also own ``compute_language_model_loss`` (LogitsSaverHooks overrides it).
+    """
+    for m in reversed(model):
+        cur: Any = m
+        for _ in range(6):
+            if hasattr(cur, "output_layer") and hasattr(cur, "compute_language_model_loss"):
+                return cur
+            nxt = getattr(cur, "module", None)
+            if nxt is None:
+                nxt = getattr(cur, "language_model", None)
+            if nxt is None:
+                break
+            cur = nxt
+    return None
+
+
 def _maybe_setup_kd(cfg: ConfigContainer, state: GlobalState, model: list[MegatronModule]) -> None:
     """KD fork: wire cached-logits distillation into the Bridge run.
 
@@ -568,7 +590,13 @@ def _maybe_setup_kd(cfg: ConfigContainer, state: GlobalState, model: list[Megatr
         hash_provider=lambda: _kd_dataset_hash(cfg),
     )
 
-    target = next((m for m in reversed(model) if hasattr(m, "output_layer")), None)
+    target = _kd_find_lm_host(model)
+    _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    import logging as _logging
+
+    _logging.getLogger(__name__).info(
+        "KD: rank=%d lm_host=%s", _rank, type(target).__name__ if target is not None else None
+    )
 
     if kd.save_logits_dir is not None:
         from megatron.training.distillation import LogitsSaverHooks
