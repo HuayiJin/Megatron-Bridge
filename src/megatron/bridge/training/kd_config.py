@@ -107,5 +107,3 @@ class KDCachedLogitsConfig(Container):
             "Teacher dump (save_logits_dir) and student KD (logprobs_dir) are "
             "separate runs; enable only one per process."
         )
-
-    _archive_fields: tuple = ()

@@ -1000,8 +1000,9 @@ class ConfigContainer(Container):
     checkpoint: CheckpointConfig
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     ft: Optional[FaultToleranceConfig] = None
-    kd: Optional[KDCachedLogitsConfig] = None
-    """KD fork: offline cached-logits distillation (teacher dump / student KD)."""
+    kd: KDCachedLogitsConfig = field(default_factory=KDCachedLogitsConfig)
+    """KD fork: offline cached-logits distillation (teacher dump / student KD).
+    Inert unless kd.save_logits_dir or kd.logprobs_dir is set (see finalize)."""
     straggler: Optional[StragglerDetectionConfig] = None
     nvrx_straggler: Optional[NVRxStragglerDetectionConfig] = None
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
@@ -1141,6 +1142,10 @@ class ConfigContainer(Container):
         Calculates dependent values like data_parallel_size and scheduler steps.
         Ensures compatibility between different configuration settings.
         """
+        # KD fork: validate cached-logits KD config (no-op when inert)
+        if self.kd is not None:
+            self.kd.finalize()
+
         if self.train.num_epochs is not None and not isinstance(self.dataset, GPTSFTDatasetConfig):
             raise ValueError(
                 "num_epochs is only supported for finite GPTSFTDatasetConfig datasets because other dataset "

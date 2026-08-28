@@ -753,6 +753,11 @@ def train(
         if should_exit:
             break
 
+    # KD fork: final flush of residual teacher payloads after the loop exits.
+    _kd_saver_final = getattr(global_state, "_kd_logits_saver", None)
+    if _kd_saver_final is not None:
+        _kd_saver_final.flush_pending()
+
     # Save final checkpoint when training completes normally and the last
     # step wasn't already persisted by the interval-based save inside
     # checkpoint_and_decide_exit.
