@@ -75,7 +75,7 @@ def get_logits_saver() -> Optional["LogitsSaverHooks"]:
     return _ACTIVE_LOGITS_SAVER
 
 
-_MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
+_MAX_VOCAB_SIZE = 2 ** 18  # 262144 - KD fork: 18-bit indices (Qwen3.5 vocab 248320)
 
 class LogitsSaverHooks:
     """
@@ -332,7 +332,7 @@ class LogitsSaverHooks:
         global_vocab_size = local_vocab_size * self.tp_size
 
         assert global_vocab_size <= _MAX_VOCAB_SIZE, (
-            f"Global vocab size {global_vocab_size} exceeds maximum supported {_MAX_VOCAB_SIZE} (17 bits)"
+            f"Global vocab size {global_vocab_size} exceeds maximum supported {_MAX_VOCAB_SIZE} (18 bits)"
         )
 
         effective_k = min(self.k, global_vocab_size)

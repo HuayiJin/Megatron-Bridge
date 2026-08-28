@@ -235,15 +235,20 @@ def sorted_batched_tars(paths: List[str]) -> List[str]:
 
 
 def pack_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split 17-bit global indices into uint16 lower bits + bool 17th bit."""
+    """Split 18-bit global indices into uint16 lower bits + uint8 high bits (bits 17-18).
+
+    KD fork: supports vocab up to 2^18 = 262144 (Qwen3.5 vocab 248320 > old 2^17 cap).
+    Storage size unchanged (bool was already 1 byte/elem). Backward compatible:
+    for vocab < 2^17 the packed bytes are identical to the old bool format.
+    """
     low_bits = (indices & 0xFFFF).to(torch.uint16)
-    bit_17 = (indices >> 16).to(torch.bool)
-    return low_bits, bit_17
+    hi_bits = ((indices >> 16) & 0x3).to(torch.uint8)
+    return low_bits, hi_bits
 
 
-def unpack_indices(low_bits: torch.Tensor, bit_17: torch.Tensor) -> torch.Tensor:
-    """Reconstruct indices from uint16 lower bits + bool 17th bit."""
-    return (bit_17.long() << 16) | low_bits.long()
+def unpack_indices(low_bits: torch.Tensor, hi_bits: torch.Tensor) -> torch.Tensor:
+    """Reconstruct indices from uint16 lower bits + high bits (payload key: 'bit_17')."""
+    return (hi_bits.long() << 16) | low_bits.long()
 
 
 class LogprobsTarEntry(NamedTuple):
