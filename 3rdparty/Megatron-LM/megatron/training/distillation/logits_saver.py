@@ -567,7 +567,6 @@ class LogitsSaverHooks:
         print_rank_0(f"Handing off {len(writes)} logit iterations for async flush")
         return (tar_path, writes, self._meta_bytes, msc_enabled)
 
-    @staticmethod
     def flush_pending(self) -> None:
         """KD fork: synchronously write any pending iteration payloads to a tar.
 
@@ -577,9 +576,10 @@ class LogitsSaverHooks:
         """
         tar_path, writes, meta_bytes, msc_enabled = self.take_pending_data()
         if writes:
-            self._write_batched_tar(tar_path, writes, meta_bytes, msc_enabled)
+            LogitsSaverHooks._write_batched_tar(tar_path, writes, meta_bytes, msc_enabled)
             logger.info("LogitsSaverHooks flushed %d iterations -> %s", len(writes), tar_path)
 
+    @staticmethod
     def _write_batched_tar(
         tar_path: str,
         writes: "OrderedDict[int, bytes]",
