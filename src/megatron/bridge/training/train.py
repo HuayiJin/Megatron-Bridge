@@ -877,18 +877,27 @@ def train_step(
     optim_config = cfg.optimizer
 
     rerun_state_machine = get_rerun_state_machine()
+    # KD fork: teacher-dump forward-only mode — run the pipeline schedule with
+    # forward_only=True (no backward, no grad buffers, no optimizer step) while
+    # keeping the exact same data-consumption order as a regular training step.
+    _kd_fwd_only = (
+        cfg.kd is not None
+        and cfg.kd.save_logits_dir is not None
+        and cfg.kd.dump_forward_only
+    )
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
-        for model_chunk in model:
-            model_chunk.zero_grad_buffer()
-        optimizer.zero_grad()
+        if not _kd_fwd_only:
+            for model_chunk in model:
+                model_chunk.zero_grad_buffer()
+            optimizer.zero_grad()
 
-        _handle_mxfp8_param_buffer_copy(
-            optimizer=optimizer,
-            model=model,
-            reuse_grad_buf_for_mxfp8_param_ag=cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag,
-            overlap_param_gather=cfg.ddp.overlap_param_gather,
-        )
+            _handle_mxfp8_param_buffer_copy(
+                optimizer=optimizer,
+                model=model,
+                reuse_grad_buf_for_mxfp8_param_ag=cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag,
+                overlap_param_gather=cfg.ddp.overlap_param_gather,
+            )
 
         # Handle finetuning vs pretraining data consumption
         seq_length = getattr(model_config, "seq_length", cfg.model.seq_length)  # Default for pretraining
@@ -935,7 +944,7 @@ def train_step(
             seq_length=seq_length,
             micro_batch_size=train_config.micro_batch_size,
             decoder_seq_length=seq_length,
-            forward_only=False,
+            forward_only=_kd_fwd_only,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             p2p_communicator=p2p_communicator,
             pg_collection=pg_collection,
@@ -951,28 +960,34 @@ def train_step(
     # Update parameters.
     nvtx_range_push(suffix="optimizer_step")
     timers("optimizer", log_level=1).start(barrier=optim_config.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-
-    # get max attention logit for logging and run clip_qk()
-    # Part of MuonClip Optimizer step
     log_max_attention_logit = None
-    if hasattr(cfg.model, "qk_clip") and cfg.model.qk_clip:
-        log_max_attention_logit = clip_qk(model)
+    if _kd_fwd_only:
+        # KD dump forward-only: no gradients were produced; skip the optimizer
+        # update entirely and report a successful (no-op) step so the train loop
+        # keeps advancing iterations / logging unchanged.
+        update_successful, grad_norm, num_zeros_in_grad = True, None, 0
+    else:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+        # get max attention logit for logging and run clip_qk()
+        # Part of MuonClip Optimizer step
+        if hasattr(cfg.model, "qk_clip") and cfg.model.qk_clip:
+            log_max_attention_logit = clip_qk(model)
 
     timers("optimizer").stop()
     nvtx_range_pop(suffix="optimizer_step")
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
-    if train_config.check_optimizer_step_success:
+    if not _kd_fwd_only and train_config.check_optimizer_step_success:
         update_successful = logical_and_across_model_parallel_group(update_successful, mp_group=pg_collection.mp)
 
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
-    if not train_config.skip_sync_grad_norm_across_mp:
+    if not _kd_fwd_only and not train_config.skip_sync_grad_norm_across_mp:
         grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, mp_group=pg_collection.mp)
 
-    if optim_config.log_num_zeros_in_grad:
+    if not _kd_fwd_only and optim_config.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad, mp_group=pg_collection.mp)
 
     # Update learning rate.

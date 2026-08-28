@@ -59,6 +59,11 @@ class KDCachedLogitsConfig(Container):
     save_dtype: str = "fp16"
     """Storage dtype for log-prob values: one of fp16/bf16/fp32."""
 
+    dump_forward_only: bool = True
+    """Teacher dump mode: skip backward + optimizer step (forward-only pipeline
+    schedule, same data consumption order as training). Validated byte-identical
+    against a full-step dump on iterations 0-160 (see kd/scripts/compare_dumps.py)."""
+
     flush_interval_iters: int = 10
     """Teacher mode: flush pending payloads to a tar every N iterations."""
 
