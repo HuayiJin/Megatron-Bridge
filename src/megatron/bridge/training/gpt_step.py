@@ -39,6 +39,7 @@ from megatron.core.utils import (
 from megatron.bridge.training.config import ConfigContainer
 from megatron.bridge.training.losses import masked_next_token_loss
 from megatron.bridge.training.post_training.distillation import loss_func_kd
+from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.utils.flop_utils import accumulate_flops_metadata, get_model_chunk_vp_stage
 from megatron.bridge.training.utils.packed_seq_utils import get_packed_seq_params, get_thd_cp_partition_indices
@@ -481,13 +482,58 @@ def forward_step(
     """
     output, loss_mask = _forward_step_common(state, data_iterator, model, return_schedule_plan)
 
-    loss_function = _create_loss_function(
-        loss_mask,
-        check_for_nan_in_loss=state.cfg.rerun_state_machine.check_for_nan_in_loss,
-        check_for_spiky_loss=state.cfg.rerun_state_machine.check_for_spiky_loss,
-    )
+    kd = getattr(state.cfg, "kd", None)
+    if kd is not None and kd.logprobs_dir is not None:
+        loss_function = _create_kd_loss_function(state, loss_mask, model)
+    else:
+        loss_function = _create_loss_function(
+            loss_mask,
+            check_for_nan_in_loss=state.cfg.rerun_state_machine.check_for_nan_in_loss,
+            check_for_spiky_loss=state.cfg.rerun_state_machine.check_for_spiky_loss,
+        )
 
     return output, loss_function
+
+
+def _create_kd_loss_function(state: GlobalState, loss_mask: torch.Tensor, model: GPTModel) -> partial:
+    """KD fork: loss closure mixing LM loss with cached-logits KL distillation.
+
+    ``(1 - alpha) * LM + alpha * KL`` with alpha linearly decayed from
+    ``kd.kd_alpha_start`` to ``kd.kd_alpha_end`` over ``kd.kd_alpha_total_iters``
+    (SlimQwen recipe). Only invoked on PP last stage ranks by the schedule.
+    """
+    from megatron.training.distillation.cached_logits_loss import LossFuncCallable
+
+    kd = state.cfg.kd
+    total = kd.kd_alpha_total_iters or state.cfg.train.train_iters
+    alpha_start, alpha_end = kd.kd_alpha_start, kd.kd_alpha_end
+    check_for_nan_in_loss = state.cfg.rerun_state_machine.check_for_nan_in_loss
+    check_for_spiky_loss = state.cfg.rerun_state_machine.check_for_spiky_loss
+
+    kd_callable = LossFuncCallable(
+        logprobs_dir=kd.logprobs_dir,
+        decode_threads=kd.kd_decode_threads,
+        prefetch_factor=kd.kd_prefetch_factor,
+        kd_loss_alpha=alpha_start,
+        ignore_errors=kd.kd_ignore_errors,
+    )
+
+    def _kd_loss(output_tensor: torch.Tensor):
+        step = state.train_state.step
+        t = min(max(step / max(total - 1, 1), 0.0), 1.0)
+        kd_callable.alpha = alpha_start + t * (alpha_end - alpha_start)
+        loss, num_tokens, report = kd_callable(loss_mask, output_tensor, model)
+        if check_for_nan_in_loss:
+            get_rerun_state_machine().validate_result(
+                result=loss,
+                rejection_func=torch.isnan,
+                message="found NaN in local forward KD loss calculation",
+                tolerance=0.0,
+                fatal=True,
+            )
+        return loss, num_tokens, report
+
+    return partial(_kd_loss)
 
 
 def _create_loss_function(loss_mask: torch.Tensor, check_for_nan_in_loss: bool, check_for_spiky_loss: bool) -> partial:

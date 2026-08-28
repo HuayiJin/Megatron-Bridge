@@ -373,6 +373,9 @@ def setup(
 
     model = _build_distributed_model(cfg, pg_collection)
 
+    # KD fork: attach cached-logits distillation hooks (teacher dump / student capture)
+    _maybe_setup_kd(cfg, state, model)
+
     cfg.model.timers = timers
     cfg.optimizer.timers = timers
     optimizer, scheduler = setup_optimizer(
@@ -515,6 +518,86 @@ def _register_pre_wrap_hook(model_cfg: ModelConfig | ModelProviderMixin, hook):
         model_cfg.pre_wrap_hooks.append(hook)
     else:
         model_cfg.register_pre_wrap_hook(hook)
+
+
+def _kd_dataset_hash(cfg: ConfigContainer) -> tuple[str, dict]:
+    """Bridge-side dataset identity hash for cached-logits distillation.
+
+    Mirrors MCore ``compute_dataset_hash`` semantics (seed / sequence length /
+    train samples / blend). Teacher and student runs derive it from identical
+    Bridge configs, so the tars' embedded hash matches the student's expected
+    hash and per-tar alignment verification passes.
+    """
+    import hashlib
+    import json as _json
+    from collections import OrderedDict
+
+    ds = cfg.dataset
+    train_samples = getattr(cfg.train, "train_samples", None)
+    if train_samples is None:
+        train_samples = int(cfg.train.train_iters) * int(cfg.train.global_batch_size)
+    blend = getattr(ds, "blend", None)
+    identifiers = OrderedDict()
+    identifiers["seed"] = cfg.rng.seed
+    identifiers["sequence_length"] = getattr(ds, "seq_length", None)
+    identifiers["train_samples"] = train_samples
+    identifiers["blend"] = {"kind": "bridge_blend", "blend": repr(blend)} if blend else {"kind": "mock", "mock": True}
+    description = _json.dumps(identifiers, sort_keys=False, separators=(",", ":"))
+    md5_hex = hashlib.md5(description.encode("utf-8"), usedforsecurity=False).hexdigest()
+    return md5_hex, dict(identifiers)
+
+
+def _maybe_setup_kd(cfg: ConfigContainer, state: GlobalState, model: list[MegatronModule]) -> None:
+    """KD fork: wire cached-logits distillation into the Bridge run.
+
+    - Teacher dump (``kd.save_logits_dir``): attach LogitsSaverHooks on the
+      local model chunk owning ``output_layer`` (PP last stage ranks only;
+      TP-group collectives inside the hook require all TP ranks of that stage).
+    - Student KD (``kd.logprobs_dir``): attach StudentLogitsCapture the same way.
+    - Both: inject iteration/dataset-hash providers (Bridge runs without MCore
+      global args).
+    """
+    kd = getattr(cfg, "kd", None)
+    if kd is None or (kd.save_logits_dir is None and kd.logprobs_dir is None):
+        return
+
+    from megatron.training.distillation.utils_logits import set_bridge_state_provider
+
+    set_bridge_state_provider(
+        iter_provider=lambda: state.train_state.step,
+        hash_provider=lambda: _kd_dataset_hash(cfg),
+    )
+
+    target = next((m for m in reversed(model) if hasattr(m, "output_layer")), None)
+
+    if kd.save_logits_dir is not None:
+        from megatron.training.distillation import LogitsSaverHooks
+
+        saver = LogitsSaverHooks(
+            save_dir=kd.save_logits_dir,
+            k=kd.save_top_k,
+            p=kd.save_top_p,
+            min_k=kd.save_top_p_min_k,
+            save_dtype=kd.save_dtype,
+            mtp_num_layers=getattr(cfg.model, "mtp_num_layers", 0) or 0,
+        )
+        if target is not None:
+            saver.attach_hooks(target)
+            print_rank_0(f"KD teacher dump: LogitsSaverHooks attached (k={kd.save_top_k}, dir={kd.save_logits_dir})")
+        else:
+            print_rank_0("KD teacher dump: no output_layer chunk on this rank (non-last PP stage), hooks not attached")
+        state._kd_logits_saver = saver
+
+    if kd.logprobs_dir is not None:
+        from megatron.training.distillation import StudentLogitsCapture
+
+        capture = StudentLogitsCapture()
+        if target is not None:
+            capture.attach_hooks(target)
+            print_rank_0(f"KD student: StudentLogitsCapture attached (dir={kd.logprobs_dir})")
+        else:
+            print_rank_0("KD student: no output_layer chunk on this rank (non-last PP stage), capture not attached")
+        state._kd_logits_capture = capture
 
 
 def _build_distributed_model(cfg: ConfigContainer, pg_collection: ProcessGroupCollection) -> list[MegatronModule]:

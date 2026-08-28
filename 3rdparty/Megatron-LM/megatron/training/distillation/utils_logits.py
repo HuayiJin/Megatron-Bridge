@@ -19,7 +19,7 @@ import re
 import tarfile
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -154,8 +154,39 @@ def storage_glob_with_caching(root: str, name_pattern: str, cached: bool = True)
     ]
 
 
+# ---------------------------------------------------------------------------
+# KD fork: injectable providers for non-MCore launchers (e.g. Megatron-Bridge)
+# ---------------------------------------------------------------------------
+
+_BRIDGE_ITER_PROVIDER: Optional[Callable[[], int]] = None
+_BRIDGE_HASH_PROVIDER: Optional[Callable[[], Tuple[str, Dict[str, Any]]]] = None
+
+
+def set_bridge_state_provider(
+    iter_provider: Optional[Callable[[], int]] = None,
+    hash_provider: Optional[Callable[[], Tuple[str, Dict[str, Any]]]] = None,
+) -> None:
+    """Inject iteration/dataset-hash providers for Bridge-style launches.
+
+    Both teacher-dump (LogitsSaverHooks) and student-consume
+    (TeacherTarDataset/CachedLogitsKDLoss) paths call these instead of
+    MCore's ``get_args()`` when providers are set.
+    """
+    global _BRIDGE_ITER_PROVIDER, _BRIDGE_HASH_PROVIDER
+    if iter_provider is not None:
+        _BRIDGE_ITER_PROVIDER = iter_provider
+    if hash_provider is not None:
+        _BRIDGE_HASH_PROVIDER = hash_provider
+
+
 def get_current_iteration() -> int:
-    """Return the current training iteration from ``get_args()``."""
+    """Return the current training iteration.
+
+    KD fork: prefer the bridge-injected provider when set (Megatron-Bridge runs
+    without MCore global args). Falls back to ``get_args()`` for native MCore.
+    """
+    if _BRIDGE_ITER_PROVIDER is not None:
+        return _BRIDGE_ITER_PROVIDER()
     args = get_args()
     iteration = getattr(args, 'curr_iteration', None)
     if iteration is None:
@@ -192,7 +223,13 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
     The fields included are exactly those that determine the global sample
     stream itself: ``seed``, ``sequence_length``, ``train_samples`` (with a
     fall-back to ``train_iters * global_batch_size``), and the data ``blend``.
+
+    KD fork: when a bridge-injected hash provider is set (Megatron-Bridge runs
+    without MCore global args), it takes precedence. Teacher and student must
+    inject providers derived from identical configs so hashes match.
     """
+    if _BRIDGE_HASH_PROVIDER is not None:
+        return _BRIDGE_HASH_PROVIDER()
     args = get_args()
     train_samples = getattr(args, 'train_samples', None)
     if train_samples is None:

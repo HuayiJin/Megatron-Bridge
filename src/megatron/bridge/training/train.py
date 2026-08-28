@@ -494,6 +494,16 @@ def train(
 
         fault_tolerance.on_training_step_end(global_state)
 
+        # KD fork: periodically flush teacher top-K log-prob payloads to tar.
+        # (Bridge checkpointing does not call MCore's logits-saver flush hook.)
+        _kd_saver = getattr(global_state, "_kd_logits_saver", None)
+        if _kd_saver is not None:
+            _kd_flush_every = (
+                config.kd.flush_interval_iters if getattr(config, "kd", None) is not None else 10
+            )
+            if global_state.train_state.step % _kd_flush_every == 0:
+                _kd_saver.flush_pending()
+
         if should_fire(callback_manager, "on_train_step_end"):
             callback_manager.fire(
                 "on_train_step_end",

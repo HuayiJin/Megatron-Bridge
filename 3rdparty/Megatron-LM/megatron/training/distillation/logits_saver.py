@@ -141,6 +141,7 @@ class LogitsSaverHooks:
         p: Optional[float] = None,
         min_k: int = 1,
         save_dtype: str = 'fp16',
+        mtp_num_layers: Optional[int] = None,
     ):
         assert k > 0, "Number of top log-probabilities to save must be positive"
         assert save_dir is not None, "Save directory must be provided"
@@ -173,8 +174,15 @@ class LogitsSaverHooks:
         self._tp_dst_rank_global = parallel_state.get_tensor_model_parallel_src_rank()
 
         # Track number of MTP outputs to ignore
-        args = get_args()
-        self._mtp_num_layers = args.mtp_num_layers or 0
+        # KD fork: explicit kwarg wins; else try MCore args (absent under Bridge)
+        if mtp_num_layers is not None:
+            self._mtp_num_layers = int(mtp_num_layers)
+        else:
+            try:
+                args = get_args()
+                self._mtp_num_layers = args.mtp_num_layers or 0
+            except Exception:
+                self._mtp_num_layers = 0
         self._curr_mtp_passes = 0
 
         # Dataset-identity hash + serialised metadata, written as the
@@ -560,6 +568,18 @@ class LogitsSaverHooks:
         return (tar_path, writes, self._meta_bytes, msc_enabled)
 
     @staticmethod
+    def flush_pending(self) -> None:
+        """KD fork: synchronously write any pending iteration payloads to a tar.
+
+        Bridge-side train loops call this periodically (there is no MCore
+        checkpoint hook to trigger the async flush). No-op when nothing is
+        pending (non-TP-rank-0 ranks or empty buffer).
+        """
+        tar_path, writes, meta_bytes, msc_enabled = self.take_pending_data()
+        if writes:
+            self._write_batched_tar(tar_path, writes, meta_bytes, msc_enabled)
+            logger.info("LogitsSaverHooks flushed %d iterations -> %s", len(writes), tar_path)
+
     def _write_batched_tar(
         tar_path: str,
         writes: "OrderedDict[int, bytes]",
