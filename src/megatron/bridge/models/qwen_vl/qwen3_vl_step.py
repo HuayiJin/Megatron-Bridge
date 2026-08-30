@@ -23,6 +23,7 @@ from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_
 from megatron.core.utils import get_batch_on_this_cp_rank, get_model_config
 
 from megatron.bridge.training.config import ConfigContainer
+from megatron.bridge.training.gpt_step import _create_kd_loss_function
 from megatron.bridge.training.losses import (
     create_masked_next_token_loss_function as _create_loss_function,
 )
@@ -333,6 +334,9 @@ def forward_step(
 
     check_for_nan_in_loss = state.cfg.rerun_state_machine.check_for_nan_in_loss
     check_for_spiky_loss = state.cfg.rerun_state_machine.check_for_spiky_loss
+    # KD fork: cached-logits distillation loss (recipe uses this VL step, not gpt_step)
+    _kd = getattr(state.cfg, "kd", None)
+    _kd_active = _kd is not None and _kd.logprobs_dir is not None
     with straggler_timer:
         if return_schedule_plan:
             assert config.overlap_moe_expert_parallel_comm, (
@@ -341,7 +345,11 @@ def forward_step(
             schedule_plan = model.build_schedule_plan(
                 tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
             )
-            loss_function = _create_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
+            loss_function = (
+                _create_kd_loss_function(state, loss_mask, model)
+                if _kd_active
+                else _create_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
+            )
             return schedule_plan, loss_function
         else:
             model_output = model(**forward_args)
@@ -350,6 +358,10 @@ def forward_step(
             else:
                 output_tensor = model_output
 
-    loss_function = _create_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
+    loss_function = (
+        _create_kd_loss_function(state, loss_mask, model)
+        if _kd_active
+        else _create_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
+    )
 
     return output_tensor, loss_function
