@@ -508,15 +508,20 @@ def _create_kd_loss_function(state: GlobalState, loss_mask: torch.Tensor, model:
     total = kd.kd_alpha_total_iters or state.cfg.train.train_iters
     alpha_start, alpha_end = kd.kd_alpha_start, kd.kd_alpha_end
     check_for_nan_in_loss = state.cfg.rerun_state_machine.check_for_nan_in_loss
-    check_for_spiky_loss = state.cfg.rerun_state_machine.check_for_spiky_loss
 
-    kd_callable = LossFuncCallable(
-        logprobs_dir=kd.logprobs_dir,
-        decode_threads=kd.kd_decode_threads,
-        prefetch_factor=kd.kd_prefetch_factor,
-        kd_loss_alpha=alpha_start,
-        ignore_errors=kd.kd_ignore_errors,
-    )
+    # Cache the heavy callable on the state: forward_step runs once per
+    # MICROBATCH, and constructing LossFuncCallable/CachedLogitsKDLoss rebuilds
+    # the tar dataset + DataLoader each time (144s/iter observed vs ~18s).
+    kd_callable = getattr(state, "_kd_loss_callable", None)
+    if kd_callable is None or kd_callable.logprobs_dir != kd.logprobs_dir:
+        kd_callable = LossFuncCallable(
+            logprobs_dir=kd.logprobs_dir,
+            decode_threads=kd.kd_decode_threads,
+            prefetch_factor=kd.kd_prefetch_factor,
+            kd_loss_alpha=alpha_start,
+            ignore_errors=kd.kd_ignore_errors,
+        )
+        state._kd_loss_callable = kd_callable
 
     def _kd_loss(output_tensor: torch.Tensor):
         step = state.train_state.step
