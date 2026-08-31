@@ -496,6 +496,11 @@ def load_megatron_model(
         ep = getattr(model_cfg, "expert_model_parallel_size", 1)
         if tp * ep == 1:
             model_cfg.moe_token_dispatcher_type = "allgather"
+            # Shared-expert overlap requires alltoall/flex dispatchers. It is a pure
+            # runtime compute-overlap optimization (no effect on weights), so it must
+            # be dropped alongside the dispatcher fallback for single-rank export.
+            if getattr(model_cfg, "moe_shared_expert_overlap", False):
+                model_cfg.moe_shared_expert_overlap = False
 
     return build_and_load_model(
         checkpoint_path, model_cfg, model_type, mlm_args, return_state_dict, use_cpu_init, skip_temp_dist_context
