@@ -291,3 +291,99 @@ def test_forward_step_scatters_padding_mask_on_later_sequence_parallel_stages(mo
     # The mask is scattered sequence-first, like the activations this stage receives.
     assert len(scattered) == 1 and scattered[0].shape == (16, 2)
     assert torch.equal(model.forward_kwargs["padding_mask"], padding_mask[:, :8])
+
+
+def test_get_batch_from_iterator_drops_visual_payloads_on_non_first_pp_or_when_disabled(monkeypatch):
+    from megatron.bridge.models.qwen_vl.qwen3_vl_step import get_batch_from_iterator
+
+    pixel_values = torch.ones((4, 3))
+    pixel_values_videos = torch.ones((2, 3))
+    image_grid_thw = torch.tensor([[1, 2, 2]])
+    video_grid_thw = torch.tensor([[1, 1, 2]])
+
+    class _FakeVisualInputs:
+        def __init__(self):
+            self.pixel_values = pixel_values
+            self.pixel_values_videos = pixel_values_videos
+            self.image_grid_thw = image_grid_thw
+            self.video_grid_thw = video_grid_thw
+
+    cuda_calls = []
+
+    def _fake_cuda(self, non_blocking=False):
+        cuda_calls.append((tuple(self.shape), non_blocking))
+        return self
+
+    monkeypatch.setattr(torch.Tensor, "cuda", _fake_cuda)
+
+    visual_inputs = _FakeVisualInputs()
+    batch = {
+        "tokens": torch.tensor([[1, 2]]),
+        "position_ids": torch.tensor([[0, 1]]),
+        "labels": torch.tensor([[2, -100]]),
+        "loss_mask": torch.tensor([[1.0, 0.0]]),
+        "visual_inputs": visual_inputs,
+    }
+
+    non_first = get_batch_from_iterator(
+        iter([batch]),
+        is_first_pp_stage=False,
+        is_last_pp_stage=True,
+    )
+    projected = non_first["visual_inputs"]
+    assert projected is not visual_inputs
+    assert projected.pixel_values is None
+    assert projected.pixel_values_videos is None
+    assert projected.image_grid_thw is image_grid_thw
+    assert projected.video_grid_thw is video_grid_thw
+    # Original object stays untouched for upstream callers / dataloader references.
+    assert visual_inputs.pixel_values is pixel_values
+    assert visual_inputs.pixel_values_videos is pixel_values_videos
+    assert (tuple(pixel_values.shape), True) not in cuda_calls
+    assert (tuple(pixel_values_videos.shape), True) not in cuda_calls
+    assert (tuple(image_grid_thw.shape), True) in cuda_calls
+    assert (tuple(video_grid_thw.shape), True) in cuda_calls
+
+    vpp_non_preprocess = get_batch_from_iterator(
+        iter([batch]),
+        is_first_pp_stage=True,
+        is_last_pp_stage=False,
+        move_pixel_values=False,
+    )
+    assert vpp_non_preprocess["visual_inputs"].pixel_values is None
+    assert vpp_non_preprocess["visual_inputs"].pixel_values_videos is None
+    assert vpp_non_preprocess["visual_inputs"].image_grid_thw is image_grid_thw
+
+
+@pytest.mark.parametrize("pre_process", [True, False])
+def test_forward_step_controls_move_pixel_values_via_model_pre_process(monkeypatch, pre_process):
+    config = _model_config()
+    model = _RecordingModel()
+    model.pre_process = pre_process
+    tokens = torch.zeros((1, 4), dtype=torch.long)
+    captured_get_batch_kwargs = {}
+
+    def _fake_get_batch(data_iterator, cfg, use_mtp=False, **kwargs):
+        del data_iterator, cfg, use_mtp
+        captured_get_batch_kwargs.update(kwargs)
+        return (
+            tokens,
+            torch.full((1, 4), -100),
+            torch.zeros((1, 4)),
+            None,
+            torch.arange(4).unsqueeze(0),
+            {},
+            None,
+        )
+
+    _patch_step_dependencies(
+        monkeypatch,
+        config=config,
+        batch=None,
+    )
+    monkeypatch.setattr("megatron.bridge.models.qwen_vl.qwen3_vl_step.get_batch", _fake_get_batch)
+
+    forward_step(_state(enable_in_batch_packing=False, seq_length=16), iter(()), model)
+
+    assert captured_get_batch_kwargs["is_first_pp_stage"] is True
+    assert captured_get_batch_kwargs["move_pixel_values"] is pre_process

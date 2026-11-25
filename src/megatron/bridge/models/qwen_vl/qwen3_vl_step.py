@@ -14,6 +14,7 @@
 import logging
 import math
 from collections.abc import Mapping
+from copy import copy
 from functools import partial
 from typing import Any, Callable, Iterable
 
@@ -45,6 +46,20 @@ from megatron.bridge.training.utils.pg_utils import get_pg_collection
 
 logger = logging.getLogger(__name__)
 
+_VISUAL_PAYLOAD_FIELDS = frozenset(("pixel_values", "pixel_values_videos"))
+
+
+def _project_visual_inputs_for_pp_stage(visual_inputs: Any, *, move_pixel_values: bool) -> Any:
+    """Drop visual payload tensors on pipeline stages without vision preprocessing."""
+    if visual_inputs is None or move_pixel_values:
+        return visual_inputs
+
+    projected = copy(visual_inputs)
+    for field_name in _VISUAL_PAYLOAD_FIELDS:
+        if hasattr(projected, field_name):
+            setattr(projected, field_name, None)
+    return projected
+
 
 def get_batch_from_iterator(
     data_iterator: Iterable,
@@ -53,6 +68,7 @@ def get_batch_from_iterator(
     *,
     is_first_pp_stage: bool,
     is_last_pp_stage: bool,
+    move_pixel_values: bool | None = None,
 ) -> dict[str, Any]:
     """Get a batch of data from the iterator.
 
@@ -88,6 +104,8 @@ def get_batch_from_iterator(
     if is_last_pp_stage:
         required_device_keys.update(("labels", "loss_mask"))
 
+    keep_visual_payload = is_first_pp_stage if move_pixel_values is None else move_pixel_values
+
     _batch_required_keys = {}
     for key, val in batch.items():
         if key in required_device_keys:
@@ -95,9 +113,10 @@ def get_batch_from_iterator(
                 if val is None:
                     _batch_required_keys[key] = None
                 else:
-                    _batch_required_keys[key] = val
+                    projected = _project_visual_inputs_for_pp_stage(val, move_pixel_values=keep_visual_payload)
+                    _batch_required_keys[key] = projected
                     # Move all visual inputs contained tensors to CUDA
-                    for k, v in val.__dict__.items():
+                    for k, v in projected.__dict__.items():
                         _batch_required_keys[key].__dict__[k] = v.cuda(non_blocking=True) if v is not None else None
             else:
                 _batch_required_keys[key] = val.cuda(non_blocking=True) if val is not None else None
@@ -116,6 +135,7 @@ def get_batch(
     *,
     is_first_pp_stage: bool,
     is_last_pp_stage: bool,
+    move_pixel_values: bool | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -145,6 +165,7 @@ def get_batch(
         getattr(cfg.dataset, "skip_getting_attention_mask_from_dataset", True),
         is_first_pp_stage=is_first_pp_stage,
         is_last_pp_stage=is_last_pp_stage,
+        move_pixel_values=move_pixel_values,
     )
 
     if "visual_inputs" in batch and batch.get("visual_inputs") is not None:
@@ -260,6 +281,8 @@ def _forward_step_common(
     this_pg_collection = get_pg_collection(model)
     is_first = is_pp_first_stage(this_pg_collection.pp)
     is_last = is_pp_last_stage(this_pg_collection.pp)
+    pre_process = getattr(unwrap_model(model), "pre_process", None)
+    move_pixel_values = is_first if pre_process is None else bool(pre_process)
 
     config = get_model_config(model)
     use_mtp = (getattr(config, "mtp_num_layers", None) or 0) > 0
@@ -274,7 +297,14 @@ def _forward_step_common(
             position_ids,
             multi_modal_inputs,
             padding_mask,
-        ) = get_batch(data_iterator, state.cfg, use_mtp, is_first_pp_stage=is_first, is_last_pp_stage=is_last)
+        ) = get_batch(
+            data_iterator,
+            state.cfg,
+            use_mtp,
+            is_first_pp_stage=is_first,
+            is_last_pp_stage=is_last,
+            move_pixel_values=move_pixel_values,
+        )
     timers("batch-generator").stop()
 
     # Qwen3-VL keeps sequence preparation in the step because model.forward
