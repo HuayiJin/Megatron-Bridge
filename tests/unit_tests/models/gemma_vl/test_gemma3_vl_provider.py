@@ -164,6 +164,35 @@ class TestGemma3VLModelProvider:
         assert provider.is_vision_language is True
         assert provider.attention_backend is AttnBackend.fused
 
+    @pytest.mark.parametrize("backend", [AttnBackend.fused, AttnBackend.auto, "fused", "auto"])
+    def test_gemma3_vl_provider_accepts_enum_and_string_fused_or_auto_backend(self, backend):
+        """Test that string and enum backend overrides for auto/fused both pass validation."""
+        provider = Gemma3VLModelProvider(
+            num_layers=28,
+            hidden_size=2560,
+            num_attention_heads=10,
+        )
+        provider.attention_backend = backend
+
+        layer_spec = gemma3_layer_spec(provider)
+        assert layer_spec.submodules.self_attention.params["attn_mask_type"] is AttnMaskType.no_mask
+        with patch("megatron.bridge.models.gemma_vl.gemma3_vl_provider.Gemma3VLModel") as model:
+            provider.provide()
+        model.assert_called_once()
+
+    @pytest.mark.parametrize("backend", [AttnBackend.flash, "flash", "local"])
+    def test_gemma3_vl_provider_rejects_unsupported_enum_or_string_backend(self, backend):
+        """Test that unsupported string/enum attention backends still fail clearly."""
+        provider = Gemma3VLModelProvider(
+            num_layers=28,
+            hidden_size=2560,
+            num_attention_heads=10,
+        )
+        provider.attention_backend = backend
+
+        with pytest.raises(ValueError, match="automatic or fused attention"):
+            provider.provide()
+
     def test_gemma3_vl_custom_vision_config(self):
         """Test Gemma3VLModelProvider with custom vision configuration."""
         custom_vision_config = SiglipVisionConfig(

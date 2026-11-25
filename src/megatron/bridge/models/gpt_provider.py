@@ -274,7 +274,7 @@ class GPTModelProvider(TransformerConfig, ModelProviderMixin[MCoreGPTModel]):
         if self.init_model_with_meta_device:
             model_init_device_context = partial(torch.device, device="meta")
 
-        if self.attention_backend == AttnBackend.local:
+        if self.attention_backend in {AttnBackend.local, "local"}:
             if hasattr(transformer_layer_spec, "submodules"):
                 transformer_layer_spec.submodules.self_attention.submodules.core_attention = MCoreDotProductAttention
         # Determine pre/post flags if not provided using vp + pp stage

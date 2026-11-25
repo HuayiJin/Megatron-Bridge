@@ -66,7 +66,7 @@ class GPTModelBuilder(MCoreGPTModelBuilder):
         """Build a GPT stage after validating MCore logit-dtype support."""
         logit_dtype_kwarg(GPTModel, self._model_config.logit_dtype)
         model_config = self._model_config
-        if model_config.attention_backend != AttnBackend.local:
+        if model_config.attention_backend not in {AttnBackend.local, "local"}:
             return super().build_model(pg_collection, pre_process, post_process, vp_stage)
 
         configured_spec = model_config.transformer_layer_spec

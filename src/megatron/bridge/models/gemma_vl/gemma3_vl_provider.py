@@ -61,7 +61,7 @@ class Gemma3VLModelProvider(Gemma3ModelProvider):
     def provide(self, pre_process=None, post_process=None, vp_stage=None) -> Gemma3VLModel:
         if not self.is_vision_language:
             raise ValueError("Gemma 3 VL requires is_vision_language=True.")
-        if self.attention_backend not in (AttnBackend.auto, AttnBackend.fused):
+        if self.attention_backend not in {AttnBackend.auto, AttnBackend.fused, "auto", "fused"}:
             raise ValueError("Gemma 3 VL requires automatic or fused attention for attention bias.")
         if self.context_parallel_size != 1:
             raise ValueError("Gemma 3 VL does not support context parallelism with attention bias.")

@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from megatron.core.transformer.enums import AttnBackend
 
 from megatron.bridge.models import gpt_provider
 from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -305,6 +306,26 @@ class TestGPTModelProvider:
         )
 
         assert provider.scatter_embedding_sequence_parallel is False
+
+    @pytest.mark.parametrize("attention_backend", [AttnBackend.local, "local"])
+    def test_local_attention_backend_supports_enum_and_string(self, attention_backend):
+        """Test that both AttnBackend.local and 'local' select local core attention."""
+        from megatron.core.transformer.dot_product_attention import DotProductAttention as MCoreDotProductAttention
+
+        provider = GPTModelProvider(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            vocab_size=256,
+            attention_backend=attention_backend,
+        )
+        provider._pg_collection = type("PG", (), {"pp": object(), "tp": object(), "cp": object()})()
+
+        with patch("megatron.bridge.models.gpt_provider.MCoreGPTModel", autospec=True) as mock_model:
+            provider.provide(pre_process=True, post_process=True)
+
+        layer_spec = mock_model.call_args.kwargs["transformer_layer_spec"]
+        assert layer_spec.submodules.self_attention.submodules.core_attention is MCoreDotProductAttention
 
     def test_attention_softmax_fp32(self):
         """Test attention softmax in FP32 configuration."""

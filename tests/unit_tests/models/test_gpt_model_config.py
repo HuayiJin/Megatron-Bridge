@@ -340,6 +340,19 @@ class TestGPTBuilderLocalAttentionBackend:
 
         assert self._core_attention_per_layer(mock_model) == [TEDotProductAttention, TEDotProductAttention]
 
+    @pytest.mark.parametrize("attention_backend", [AttnBackend.local, "local"])
+    @patch("megatron.core.parallel_state.get_pipeline_model_parallel_rank", return_value=0)
+    @patch("megatron.training.models.gpt.GPTModel")
+    def test_string_and_enum_local_backend_both_use_local_attention(
+        self, mock_model, _pp_rank, attention_backend: AttnBackend | str
+    ) -> None:
+        config = self._make_moe_model_config(attention_backend)
+
+        GPTModelBuilder(config).build_model(Mock(), pre_process=True, post_process=True)
+
+        assert self._core_attention_per_layer(mock_model) == [DotProductAttention, DotProductAttention]
+        assert config.transformer_layer_spec is None
+
 
 def _mla_transformer(**kwargs) -> MLATransformerConfig:
     values = dict(
