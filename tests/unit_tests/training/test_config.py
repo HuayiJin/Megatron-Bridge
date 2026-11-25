@@ -3421,6 +3421,48 @@ class TestRerunConfigValidation:
             cfg.reset_position_ids = None
             cfg.finalize()
 
+    def test_gptdataset_config_create_attention_mask_follows_skip_setting(self):
+        default_cfg = GPTDatasetConfig(
+            random_seed=1234,
+            seq_length=1024,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        )
+        assert default_cfg.skip_getting_attention_mask_from_dataset is True
+        assert default_cfg.create_attention_mask is False
+
+        mock_cfg = MockGPTDatasetConfig(
+            random_seed=1234,
+            seq_length=1024,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        )
+        assert mock_cfg.skip_getting_attention_mask_from_dataset is True
+        assert mock_cfg.create_attention_mask is False
+
+        explicit_mask_cfg = GPTDatasetConfig(
+            random_seed=1234,
+            seq_length=1024,
+            skip_getting_attention_mask_from_dataset=True,
+            create_attention_mask=True,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        )
+        assert explicit_mask_cfg.create_attention_mask is True
+
+        dataset_mask_cfg = GPTDatasetConfig(
+            random_seed=1234,
+            seq_length=1024,
+            skip_getting_attention_mask_from_dataset=False,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        )
+        assert dataset_mask_cfg.create_attention_mask is True
+
     def test_profiling_config(self):
         self._check_finalize_idempotency(create_test_profiling_config)
 

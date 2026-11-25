@@ -395,6 +395,7 @@ def _mock_dataset_config(config: ConfigContainer) -> MockGPTDatasetConfig:
         data_sharding=True,
         dataloader_type="single",
         skip_getting_attention_mask_from_dataset=True,
+        create_attention_mask=False,
     )
 
 
@@ -413,6 +414,7 @@ def _megatron_indexed_dataset_config(config: ConfigContainer) -> GPTDatasetConfi
         data_sharding=True,
         dataloader_type="single",
         skip_getting_attention_mask_from_dataset=True,
+        create_attention_mask=False,
     )
 
 

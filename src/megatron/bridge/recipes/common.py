@@ -106,6 +106,7 @@ def _pretrain_common() -> ConfigContainer:
             data_sharding=True,
             dataloader_type="single",
             skip_getting_attention_mask_from_dataset=True,
+            create_attention_mask=False,
         ),
         # Logger config
         logger=LoggerConfig(

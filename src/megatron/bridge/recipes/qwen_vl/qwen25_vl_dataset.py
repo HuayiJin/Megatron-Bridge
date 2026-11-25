@@ -199,7 +199,7 @@ class MockQwen25VLDatasetProvider(DatasetProvider):
     random_seed: int = 0
     image_size: Tuple[int, int] = (256, 256)
     pad_to_max_length: bool = True
-    create_attention_mask: bool = True
+    create_attention_mask: bool = False
 
     # Keep parity with GPTDatasetConfig usage in batching utilities
     skip_getting_attention_mask_from_dataset: bool = True
